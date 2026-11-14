@@ -5,9 +5,10 @@ from glom import delete
 
 from .logger import logger
 from .utils import getenv
+from .config import get_moodle_url, get_moodle_token
 
-MOODLE_URL = getenv("MOODLE_URL")
-MOODLE_TOKEN = getenv("MOODLE_TOKEN")
+MOODLE_URL = get_moodle_url()
+MOODLE_TOKEN = get_moodle_token()
 
 
 class MoodleAPIError(Exception):
@@ -92,11 +93,54 @@ def format_moodle_array_params(key: str, values: list) -> dict:
     return {f"{key}[{i}]": v for i, v in enumerate(values)}
 
 
+def get_active_moodle_token() -> str | None:
+    """Retrieve the Moodle token: prefer the one linked to the active OAuth session, falling back to config/env."""
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+        from .auth import get_active_provider
+        acc = get_access_token()
+        if acc and acc.token:
+            prov = get_active_provider()
+            if prov:
+                token = prov.get_moodle_token_for_access_token(acc.token)
+                if token:
+                    return token
+    except Exception:
+        pass
+
+    import sys
+    this_mod = sys.modules.get(__name__)
+    return (getattr(this_mod, "MOODLE_TOKEN", None) if this_mod else None) or get_moodle_token()
+
+
+def get_active_moodle_url() -> str | None:
+    """Retrieve the Moodle base URL: prefer the one linked to the active OAuth session, falling back to config/env."""
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+        from .auth import get_active_provider
+        acc = get_access_token()
+        if acc and acc.token:
+            prov = get_active_provider()
+            if prov:
+                url = prov.get_moodle_url_for_access_token(acc.token)
+                if url:
+                    return url
+    except Exception:
+        pass
+
+    import sys
+    this_mod = sys.modules.get(__name__)
+    return (getattr(this_mod, "MOODLE_URL", None) if this_mod else None) or get_moodle_url()
+
+
 def get_moodle_api_data(
     function: APIFunction, params: dict = None, use_original_data=True
 ):
+    active_url = get_active_moodle_url()
+    active_token = get_active_moodle_token()
+
     request_params = {
-        "wstoken": MOODLE_TOKEN,
+        "wstoken": active_token,
         "wsfunction": function.value,
         "moodlewsrestformat": "json",
     }
@@ -109,10 +153,7 @@ def get_moodle_api_data(
     )
 
     try:
-        if function == APIFunction.enrol_self_enrol_user:
-            rsp = requests.post(MOODLE_URL, data=request_params, timeout=30)
-        else:
-            rsp = requests.get(MOODLE_URL, params=request_params, timeout=30)
+        rsp = requests.post(active_url, data=request_params, timeout=30)
     except requests.RequestException as e:
         # Requests exceptions can contain the URL, token and enrolment key.
         logger.error(f"Network error calling {function.value}: {type(e).__name__}")

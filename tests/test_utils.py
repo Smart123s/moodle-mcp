@@ -42,8 +42,8 @@ def test_writes_when_env_var_set(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(
-    hasattr(os, "geteuid") and os.geteuid() == 0,
-    reason="root ignores directory permissions",
+    (hasattr(os, "geteuid") and os.geteuid() == 0) or os.name == "nt",
+    reason="root or Windows ignores POSIX directory permissions",
 )
 def test_unwritable_dir_does_not_raise(monkeypatch, tmp_path, caplog):
     readonly = tmp_path / "readonly"

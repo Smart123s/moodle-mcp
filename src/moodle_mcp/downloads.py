@@ -12,7 +12,15 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import requests
 from typing_extensions import TypedDict
 
-from .moodle import APIFunction, MOODLE_TOKEN, MOODLE_URL, get_moodle_api_data
+from .config import get_moodle_token, get_moodle_url
+from .moodle import (
+    APIFunction,
+    MOODLE_TOKEN,
+    MOODLE_URL,
+    get_active_moodle_token,
+    get_active_moodle_url,
+    get_moodle_api_data,
+)
 from .utils import getenv
 
 DOWNLOAD_DIR_ENV = "MOODLE_MCP_DOWNLOAD_DIR"
@@ -69,7 +77,14 @@ def list_course_files(courseid: int) -> list[CourseFile]:
 
 
 def _authenticated_url(fileurl: str) -> str:
-    base, target = urlsplit(MOODLE_URL), urlsplit(fileurl)
+    import sys
+    this_mod = sys.modules.get(__name__)
+    active_url = get_active_moodle_url() or (getattr(this_mod, "MOODLE_URL", None) if this_mod else None)
+    active_token = get_active_moodle_token() or (getattr(this_mod, "MOODLE_TOKEN", None) if this_mod else None)
+    if not active_url or not active_token:
+        raise ValueError("Moodle credentials are not configured")
+
+    base, target = urlsplit(active_url), urlsplit(fileurl)
     prefix = base.path.split("/webservice/", 1)[0]
     endpoint = prefix + "/webservice/pluginfile.php"
     if (target.scheme, target.netloc) != (base.scheme, base.netloc) or not (
@@ -78,7 +93,7 @@ def _authenticated_url(fileurl: str) -> str:
         raise ValueError("Only this Moodle site's webservice/pluginfile.php files are supported")
     query = [(k, v) for k, v in parse_qsl(target.query, keep_blank_values=True)
              if k.lower() not in {"token", "wstoken"}]
-    query.append(("token", MOODLE_TOKEN))
+    query.append(("token", active_token))
     return urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), ""))
 
 
@@ -94,6 +109,41 @@ def _safe_filename(filename: str) -> str:
     return name
 
 
+def _resolve_output_dir(output_dir: str | None, courseid: int, subpath: str | None = None) -> Path:
+    """Resolve and validate the download directory against allowed roots (SEC-09)."""
+    if not output_dir:
+        base = _default_download_dir(courseid)
+        return (base / subpath).resolve() if subpath else base.resolve()
+
+    directory = (Path(output_dir).expanduser() / subpath).resolve() if subpath else Path(output_dir).expanduser().resolve()
+    allowed_roots = [
+        Path.home().resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+    configured_dir = getenv(DOWNLOAD_DIR_ENV)
+    if configured_dir:
+        allowed_roots.append(Path(configured_dir).expanduser().resolve())
+
+    is_allowed = any(
+        directory == root or root in directory.parents
+        for root in allowed_roots
+    )
+    if not is_allowed:
+        raise ValueError(
+            f"output_dir must be inside the user home, temporary, or configured download directory: {directory}"
+        )
+
+    forbidden_roots = {
+        Path("/"), Path("/etc"), Path("/bin"), Path("/sbin"),
+        Path("/usr"), Path("/boot"), Path("/sys"), Path("/proc"),
+        Path("/dev"), Path("/root")
+    }
+    if directory in forbidden_roots:
+        raise ValueError(f"output_dir cannot be a system root directory: {directory}")
+
+    return directory
+
+
 def download_course_file(courseid: int, moduleid: int, filename: str | None = None,
                          output_dir: str | None = None,
                          filepath: str | None = None) -> DownloadResult:
@@ -105,8 +155,7 @@ def download_course_file(courseid: int, moduleid: int, filename: str | None = No
     if len(matches) != 1:
         raise ValueError("File not found or ambiguous; use list_course_files and specify filename/filepath")
     metadata, fileurl = matches[0]
-    directory = (Path(output_dir).expanduser() if output_dir
-                 else _default_download_dir(courseid)).resolve()
+    directory = _resolve_output_dir(output_dir, courseid)
     return _download_file(metadata, fileurl, directory / _safe_filename(metadata["filename"]))
 
 
@@ -118,11 +167,14 @@ def _move_without_overwrite(source: Path, destination: Path) -> None:
     except FileExistsError:
         raise
     except OSError:
-        # Some file systems (exFAT/FAT32 drives, cloud-synced folders, some
-        # network shares) do not support hard links.
-        if destination.exists():
+        # On file systems without hard link support, atomically claim the destination
+        # using O_CREAT | O_EXCL to prevent TOCTOU race conditions (SEC-10).
+        try:
+            fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            os.replace(source, destination)
+        except FileExistsError:
             raise FileExistsError(f"File already exists: {destination}") from None
-        os.replace(source, destination)
 
 
 def _download_file(metadata: CourseFile, fileurl: str, destination: Path) -> DownloadResult:
@@ -218,8 +270,7 @@ def _save_manifest(path: Path, data: dict) -> None:
 def download_course_files(courseid: int, output_dir: str | None = None) -> CourseDownloadResult:
     """Download all API-listed course files, with a resumable local manifest."""
     files = list(_files(courseid))  # Fetch course contents once for the entire batch.
-    root = (Path(output_dir).expanduser() if output_dir
-            else _default_download_dir(courseid) / "course").resolve()
+    root = _resolve_output_dir(output_dir, courseid, subpath=None if output_dir else "course")
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "moodle-downloads.json"
     manifest = {"courseid": courseid, "files": {}}

@@ -17,10 +17,17 @@ moodle-mcp = "moodle_mcp.server:main"
 [project.urls]
 Homepage = "https://github.com/loyaniu/moodle-mcp"
 
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+]
+
 [tool.uv]
 package = true
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=9.2.0",
 ]

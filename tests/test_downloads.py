@@ -52,6 +52,24 @@ class DownloadTests(unittest.TestCase):
             self.download(self.response())
         self.assertEqual(target.read_bytes(), b"existing")
 
+    def test_move_without_overwrite_fallback_atomicity(self):
+        source = Path(self.directory.name) / "src.tmp"
+        dest = Path(self.directory.name) / "dest.txt"
+        source.write_bytes(b"data")
+
+        # Fallback when os.link raises OSError
+        with patch("moodle_mcp.downloads.os.link", side_effect=OSError("Operation not supported")):
+            downloads._move_without_overwrite(source, dest)
+            self.assertEqual(dest.read_bytes(), b"data")
+
+        # Refuses overwrite if destination already exists
+        source2 = Path(self.directory.name) / "src2.tmp"
+        source2.write_bytes(b"data2")
+        with patch("moodle_mcp.downloads.os.link", side_effect=OSError("Operation not supported")):
+            with self.assertRaises(FileExistsError):
+                downloads._move_without_overwrite(source2, dest)
+            self.assertEqual(dest.read_bytes(), b"data")
+
     def test_rejects_errors_and_partial_downloads(self):
         for response in [self.response(content_type="text/html"),
                          self.response(status=302), self.response(body=b"short"),

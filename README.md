@@ -69,6 +69,90 @@ The server exposes the following tools.
 | `weekly_review` | Weekly summary of submitted/graded counts, deadlines, overdue count, and progress |
 | `ask_moodle` | Ask a natural language question and have it routed to the right data sources |
 
+## Deploying on NAS & Connecting to Gemini Web
+
+You can run this MCP server as a standalone Docker container on your NAS (Synology, QNAP, Unraid, TrueNAS, etc.) and connect it directly to **Gemini Web** (`gemini.google.com`).
+
+### Architecture & Security Overview
+
+- **Gemini Web Integration:** Implements the Model Context Protocol (MCP) over modern **Streamable HTTP** transport (`/mcp`), compliant with Gemini's Connected Apps specification.
+- **Auto-Discovery Metadata:** Exposes both `/.well-known/oauth-authorization-server` (RFC 8414) and `/.well-known/openid-configuration` (OpenID Connect Discovery 1.0) so Gemini Web automatically detects endpoint configuration.
+- **OAuth Endpoints with PKCE:** Exposes standard endpoints `/oauth/authorize` (and `/authorize`) and `/oauth/token` (and `/token`) enforcing PKCE (`S256`) code challenge verification.
+- **Strict Public URL Protection:** The server is accessible on the public internet, so any unauthenticated request to `/mcp` is rejected with `HTTP 401 Unauthorized`. Only requests carrying a valid OAuth 2.0 Bearer token issued during Gemini authentication are admitted.
+- **Interactive Moodle Onboarding:** During the OAuth authentication handshake with Gemini, the server opens a web setup page asking for your **Moodle Base URL** and **Token**.
+- **JSON Configuration Persistence:** The verified credentials and Moodle site details are stored in a persistent JSON file (`/data/credentials.json`). Tokens and dynamic client registrations persist in `/data/oauth_store.json`.
+
+---
+
+### Step 1: Deploy with Docker or Docker Compose on NAS
+
+#### Using `docker-compose.yml` (Recommended):
+
+```yaml
+services:
+  moodle-mcp:
+    image: ghcr.io/<your-github-user-or-org>/moodle-mcp:latest
+    container_name: moodle-mcp
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # REQUIRED: The public HTTPS URL where your server is reached (e.g. via reverse proxy)
+      - PUBLIC_URL=https://moodle-mcp.your-domain.com
+    volumes:
+      # Persistent storage on your NAS for credentials.json & OAuth store
+      - ./data:/data
+```
+
+#### Using Docker CLI:
+
+```sh
+docker run -d \
+  --name moodle-mcp \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -e PUBLIC_URL=https://moodle-mcp.your-domain.com \
+  -v /volume1/docker/moodle-mcp/data:/data \
+  ghcr.io/<your-github-user-or-org>/moodle-mcp:latest
+```
+
+> [!IMPORTANT]
+> Gemini Web requires a public **HTTPS** endpoint. Set up a reverse proxy on your NAS (e.g., Synology Reverse Proxy, Nginx Proxy Manager, Caddy, Traefik, or Cloudflare Tunnel) with a valid SSL/TLS certificate.
+
+---
+
+### Step 2: Connect from Gemini Web
+
+1. Open **Gemini** (`gemini.google.com`).
+2. Navigate to **Settings** &rarr; **Connected Apps** (or **Custom apps**).
+3. Click **Add a custom app** (or **+ Custom App**).
+4. Enter your public MCP URL:
+   ```
+   https://moodle-mcp.your-domain.com/mcp
+   ```
+5. Click **Next** / **Connect**. Gemini detects the discovery metadata and opens the authorization pop-up.
+6. In the pop-up:
+   - Enter your **Moodle Base URL** (e.g. `https://moodle.your-university.edu`).
+   - Enter your **Moodle Web Service Token** (from Moodle *Preferences* &rarr; *Security keys*).
+   - Click **Save & Authorize Gemini**.
+7. The server tests the connection against Moodle, saves the configuration into `/data/credentials.json`, mints an authorization code, and redirects back to Gemini to complete the handshake!
+8. In your Gemini chats, use `@moodle-mcp` or ask questions about your courses, assignments, deadlines, and grades!
+
+---
+
+### Step 3: CI/CD via GitHub Actions
+
+This repository includes a GitHub Actions workflow (`.github/workflows/docker.yml`) that automatically:
+- Builds multi-architecture Docker images (`linux/amd64` and `linux/arm64` for Intel and ARM-based NAS hardware).
+- Publishes the image to **GitHub Container Registry (`ghcr.io`)** on every push to `main` and on new release tags.
+- Uses GitHub Actions layer caching for fast builds.
+
+To trigger the first build:
+1. Push your changes or create a release tag (e.g. `v0.3.0`).
+2. Alternatively, go to GitHub &rarr; **Actions** &rarr; **Build and Publish Docker Image** &rarr; **Run workflow**.
+
+---
+
 ## Setup Instructions
 
 ### Method 1: Using `uvx` (recommended)

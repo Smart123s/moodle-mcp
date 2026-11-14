@@ -11,3 +11,10 @@ wheels/
 
 output/
 .env
+
+# Moodle MCP credentials, OAuth store, and runtime data
+credentials.json
+moodle_config.json
+oauth_store.json
+data/
+*.tmp

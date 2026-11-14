@@ -1,0 +1,23 @@
+services:
+  moodle-mcp:
+    build: .
+    image: ghcr.io/smart123s/moodle-mcp:latest
+    container_name: moodle-mcp
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # REQUIRED: The public HTTPS URL under which your MCP server is accessible on the internet
+      # Example: https://moodle-mcp.mydomain.synology.me or https://moodle-mcp.mycustomdomain.com
+      - PUBLIC_URL=https://moodle-mcp.your-domain.com
+
+      # OPTIONAL: Default Moodle URL (e.g. https://moodle.your-university.edu/webservice/rest/server.php)
+      # If unset here, you can simply type it in on the setup page during Gemini connection.
+      # - MOODLE_URL=https://moodle.your-university.edu/webservice/rest/server.php
+
+      # OPTIONAL: Token lifetime configuration
+      # - ACCESS_TOKEN_LIFETIME_SECONDS=2592000  # 30 days
+      # - REFRESH_TOKEN_LIFETIME_SECONDS=7776000 # 90 days
+    volumes:
+      # Persist Moodle credentials JSON (credentials.json) and OAuth tokens on your NAS
+      - ./data:/data

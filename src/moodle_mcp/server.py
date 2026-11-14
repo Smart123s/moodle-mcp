@@ -1,10 +1,24 @@
+import argparse
+import os
+
 from mcp.server.mcpserver import MCPServer
+from mcp.server.auth.handlers.authorize import AuthorizationHandler
+from mcp.server.auth.handlers.token import TokenHandler
+from mcp.server.auth.handlers.register import RegistrationHandler
+from mcp.server.auth.middleware.client_auth import ClientAuthenticator
+from mcp.server.auth.routes import _body_limited, _cors
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.server.auth.provider import ProviderTokenVerifier
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.routing import Route, request_response
 
 from . import api
 from . import enrolment
 from . import downloads
+from .auth import MoodleOAuthProvider, set_active_provider
 from .logger import logger
+from .web import create_openid_metadata_handler, create_web_routes
 
 mcp = MCPServer("moodle-mcp", dependencies=["glom", "requests"])
 
@@ -230,6 +244,154 @@ def create_implementation_plan(assignid: int) -> api.ImplementationPlan:
     return api.create_implementation_plan(assignid)
 
 
+def configure_http_server(
+    server: MCPServer,
+    public_url: str | None = None,
+) -> MoodleOAuthProvider:
+    """Configure MCPServer with OAuth 2.0 authentication and web routes for Gemini Web."""
+    public_url_str = (
+        public_url
+        or os.getenv("MCP_PUBLIC_URL")
+        or os.getenv("PUBLIC_URL")
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
+
+    provider = MoodleOAuthProvider()
+    set_active_provider(provider)
+    token_verifier = ProviderTokenVerifier(provider)
+
+    server._auth_server_provider = provider
+    server._token_verifier = token_verifier
+    server.settings.auth = AuthSettings(
+        issuer_url=public_url_str,
+        resource_server_url=f"{public_url_str}/mcp",
+        validate_token_resource=False,
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    )
+
+    # Remove previously registered custom routes with the same paths to allow re-configuration
+    managed_paths = (
+        "/auth/setup",
+        "/",
+        "/health",
+        "/.well-known/openid-configuration",
+        "/oauth/authorize",
+        "/oauth/token",
+        "/oauth/register",
+    )
+    server._custom_starlette_routes = [
+        r for r in server._custom_starlette_routes
+        if getattr(r, "path", None) not in managed_paths
+    ]
+
+    client_authenticator = ClientAuthenticator(provider)
+    token_handler = TokenHandler(provider, client_authenticator)
+    auth_handler = AuthorizationHandler(provider)
+    registration_handler = RegistrationHandler(provider, ClientRegistrationOptions(enabled=True))
+
+    # Register standard OAuth/OIDC endpoint aliases for Gemini Web
+    server._custom_starlette_routes.extend([
+        Route(
+            "/oauth/authorize",
+            endpoint=_body_limited(request_response(auth_handler.handle)),
+            methods=["GET", "POST"],
+        ),
+        Route(
+            "/oauth/token",
+            endpoint=_cors(_body_limited(request_response(token_handler.handle)), ["POST", "OPTIONS"]),
+            methods=["POST", "OPTIONS"],
+        ),
+        Route(
+            "/oauth/register",
+            endpoint=_cors(_body_limited(request_response(registration_handler.handle)), ["POST", "OPTIONS"]),
+            methods=["POST", "OPTIONS"],
+        ),
+        Route(
+            "/.well-known/openid-configuration",
+            endpoint=create_openid_metadata_handler(public_url_str),
+            methods=["GET", "OPTIONS"],
+        ),
+    ])
+
+    setup_get, setup_post, home_get, health_get = create_web_routes(provider)
+    server.custom_route("/auth/setup", methods=["GET"])(setup_get)
+    server.custom_route("/auth/setup", methods=["POST"])(setup_post)
+    server.custom_route("/", methods=["GET"])(home_get)
+    server.custom_route("/health", methods=["GET"])(health_get)
+
+    return provider
+
+
 def main():
-    logger.info("Starting moodle-mcp server")
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Moodle MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http", "sse"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="Transport type: stdio (default) or streamable-http (for Gemini Web / NAS)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "0.0.0.0"),
+        help="Host address to bind HTTP server (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8000")),
+        help="Port to bind HTTP server (default: 8000)",
+    )
+    parser.add_argument(
+        "--public-url",
+        default=os.getenv("MCP_PUBLIC_URL") or os.getenv("PUBLIC_URL"),
+        help="Public HTTPS URL for this MCP server (e.g. https://moodle-mcp.yournas.com)",
+    )
+    args = parser.parse_args()
+
+    if args.transport in ("streamable-http", "sse"):
+        configure_http_server(mcp, public_url=args.public_url)
+
+        # Enable DNS rebinding protection (SEC-05) with allowed hosts and origins
+        allowed_hosts = [
+            "localhost",
+            "localhost:*",
+            "127.0.0.1",
+            "127.0.0.1:*",
+            args.host,
+            f"{args.host}:*",
+        ]
+        allowed_origins = [
+            "https://gemini.google.com",
+            "https://vertexaisearch.cloud.google.com",
+        ]
+        if args.public_url:
+            from urllib.parse import urlparse
+            parsed_public = urlparse(args.public_url)
+            if parsed_public.netloc:
+                host_only = parsed_public.netloc.split(":")[0]
+                allowed_hosts.extend([parsed_public.netloc, host_only, f"{host_only}:*"])
+                allowed_origins.append(f"{parsed_public.scheme}://{parsed_public.netloc}")
+
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(dict.fromkeys(allowed_hosts)),
+            allowed_origins=list(dict.fromkeys(allowed_origins)),
+        )
+        public_url_display = mcp.settings.auth.issuer_url if mcp.settings.auth else "unset"
+        logger.info(
+            f"Starting moodle-mcp server ({args.transport}) on {args.host}:{args.port} "
+            f"(Public URL: {public_url_display})"
+        )
+        mcp.run(
+            transport=args.transport,
+            host=args.host,
+            port=args.port,
+            transport_security=transport_security,
+        )
+    else:
+        logger.info("Starting moodle-mcp server (stdio)")
+        mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
