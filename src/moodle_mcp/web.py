@@ -1,22 +1,17 @@
 import html
-import os
 import secrets
 import time
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from mcp.server.auth.provider import AuthorizationCode, construct_redirect_uri
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from mcp.server.auth.provider import AuthorizationCode, construct_redirect_uri
-
 from .auth import MoodleOAuthProvider
 from .config import (
-    get_config_path,
-    get_moodle_token,
     get_moodle_url,
-    is_configured,
     load_config,
     normalize_moodle_url,
     save_config,
@@ -183,7 +178,6 @@ def render_setup_page(
     config = load_config()
     env_url = get_moodle_url()
     current_url = moodle_url or env_url or (config.get("moodle_url") if config else None) or ""
-    current_site = site_info or (config.get("site_info") if config else None)
 
     error_html = (
         f'<div class="alert alert-error">{html.escape(error_message)}</div>'
@@ -197,27 +191,11 @@ def render_setup_page(
     )
 
     status_html = ""
-    if current_site:
-        sitename = html.escape(str(current_site.get("sitename", "Moodle")))
-        username = html.escape(str(current_site.get("username", "")))
-        status_html = f"""
-        <div class="info-box">
-            <span class="status-dot dot-green"></span>
-            <strong>Currently linked:</strong> {sitename} ({username})
-        </div>
-        """
-    elif env_url:
-        status_html = f"""
-        <div class="info-box">
-            <span class="status-dot dot-green"></span>
-            <strong>Status:</strong> Server configured with {html.escape(env_url)}. Ready for user authentication.
-        </div>
-        """
-    elif is_configured():
+    if env_url:
         status_html = """
         <div class="info-box">
             <span class="status-dot dot-green"></span>
-            <strong>Status:</strong> Moodle server URL configured. Ready for user authentication.
+            <strong>Status:</strong> Moodle server configured. Ready for user authentication.
         </div>
         """
     else:
@@ -322,76 +300,6 @@ def render_setup_page(
     return HTMLResponse(content=html_content)
 
 
-def render_home_page() -> HTMLResponse:
-    """Render the public landing page with connection status and guide."""
-    config = load_config()
-    configured = is_configured()
-    site_info = config.get("site_info") if config else None
-
-    if configured and site_info:
-        status_badge = '<span class="status-dot dot-green"></span> <strong style="color: #166534;">Connected to Moodle</strong>'
-        details = f"""
-        <p><strong>Site:</strong> {html.escape(site_info.get('sitename', 'Moodle'))}</p>
-        <p><strong>User:</strong> {html.escape(site_info.get('fullname', site_info.get('username', '')))}</p>
-        <p><strong>Endpoint:</strong> {html.escape(config.get('moodle_url', ''))}</p>
-        """
-    elif configured:
-        status_badge = '<span class="status-dot dot-green"></span> <strong style="color: #166534;">Configured</strong>'
-        details = f"<p><strong>Endpoint:</strong> {html.escape(config.get('moodle_url', ''))}</p>"
-    else:
-        status_badge = '<span class="status-dot dot-orange"></span> <strong style="color: #c2410c;">Pending Moodle Configuration</strong>'
-        details = "<p>Moodle credentials have not been configured yet. They will be requested when connecting from Gemini Web, or can be set via <a href='/auth/setup'>Setup</a>.</p>"
-
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Moodle MCP Server</title>
-    <style>{_get_page_styles()}</style>
-</head>
-<body>
-    <div class="container" style="max-width: 600px;">
-        <div class="header">
-            <div class="logo-container">
-                <span class="logo-badge badge-moodle">Moodle</span>
-                <span class="logo-badge badge-gemini">MCP Server</span>
-            </div>
-            <h1>Moodle Model Context Protocol Server</h1>
-            <p class="subtitle">Streamable HTTP interface for Gemini Web &amp; AI Assistants</p>
-        </div>
-
-        <div class="info-box">
-            <div style="margin-bottom: 10px;">{status_badge}</div>
-            {details}
-        </div>
-
-        <div style="font-size: 14px; margin-bottom: 20px;">
-            <h3 style="font-size: 15px; margin-bottom: 8px;">How to Connect to Gemini Web:</h3>
-            <ol style="padding-left: 20px; line-height: 1.8;">
-                <li>Open <strong>Gemini Web</strong> (<code>gemini.google.com</code>).</li>
-                <li>Go to <strong>Settings</strong> &rarr; <strong>Connected Apps</strong>.</li>
-                <li>Click <strong>+ Custom App</strong>.</li>
-                <li>Enter your public MCP URL: <code>https://&lt;your-nas-domain&gt;/mcp</code>.</li>
-                <li>When prompted, authenticate and link your Moodle URL &amp; Token.</li>
-                <li>Ask Gemini questions about courses, assignments, deadlines, and grades!</li>
-            </ol>
-        </div>
-
-        <div style="text-align: center;">
-            <a href="/auth/setup" style="display: inline-block; font-size: 14px; color: var(--gemini); text-decoration: none; font-weight: 600;">
-                &rarr; Manage Moodle Connection Settings
-            </a>
-        </div>
-
-        <div class="footer">
-            Protected with OAuth 2.0 Bearer Authentication &bull; Model Context Protocol
-        </div>
-    </div>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html_content)
 
 
 def create_openid_metadata_handler(public_url: str):
@@ -513,8 +421,8 @@ def create_web_routes(provider: MoodleOAuthProvider):
         # Save credentials as fallback and update in-memory modules
         save_config(moodle_token=moodle_token, site_info=site_info, moodle_url=moodle_url)
 
-        from . import moodle as moodle_mod
         from . import downloads as downloads_mod
+        from . import moodle as moodle_mod
 
         moodle_mod.MOODLE_URL = moodle_url
         moodle_mod.MOODLE_TOKEN = moodle_token
@@ -549,17 +457,7 @@ def create_web_routes(provider: MoodleOAuthProvider):
         logger.info(f"Moodle verified. Redirecting back to OAuth callback: {redirect_url}")
         return RedirectResponse(redirect_url, status_code=302)
 
-    async def home_get(request: Request) -> Response:
-        return render_home_page()
-
     async def health_get(request: Request) -> Response:
-        cfg = load_config()
-        return JSONResponse(
-            {
-                "status": "ok",
-                "configured": is_configured(),
-                "site": cfg.get("site_info", {}).get("sitename") if cfg else None,
-            }
-        )
+        return JSONResponse({"status": "ok"})
 
-    return setup_get, setup_post, home_get, health_get
+    return setup_get, setup_post, health_get

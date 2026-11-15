@@ -1,17 +1,16 @@
 import json
-import tempfile
 import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from mcp.server.auth.provider import AuthorizationParams, OAuthClientInformationFull, ProviderTokenVerifier
 from pydantic import AnyUrl
 from starlette.testclient import TestClient
 
 from moodle_mcp import config
 from moodle_mcp.auth import MoodleOAuthProvider
 from moodle_mcp.server import configure_http_server, mcp
-from mcp.server.auth.provider import AuthorizationParams, OAuthClientInformationFull, ProviderTokenVerifier
 
 
 def test_normalize_moodle_url():
@@ -154,13 +153,23 @@ def test_discovery_and_oauth_endpoints(tmp_path, monkeypatch):
     r_token2 = client.post("/oauth/token")
     assert r_token2.status_code == 401
 
-    # 5. Setup UI: verify NO password field exists
+    # 5. Setup UI: verify NO password field exists and NO user credentials leaked
     r_setup = client.get("/auth/setup")
     assert r_setup.status_code == 200
     assert "setup_password" not in r_setup.text
     assert "Administrator Password" not in r_setup.text
+    assert "Currently linked:" not in r_setup.text
 
-    # 6. Protected resource /mcp requires Bearer auth
+    # 6. Web dashboard removed at root: returns 404 and does not leak info
+    r_root = client.get("/")
+    assert r_root.status_code == 404
+
+    # 7. Healthcheck endpoint does not leak site/user info
+    r_health = client.get("/health")
+    assert r_health.status_code == 200
+    assert r_health.json() == {"status": "ok"}
+
+    # 8. Protected resource /mcp requires Bearer auth
     r_mcp_unauth = client.get("/mcp")
     assert r_mcp_unauth.status_code == 401
     assert "WWW-Authenticate" in r_mcp_unauth.headers

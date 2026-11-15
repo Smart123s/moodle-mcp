@@ -313,10 +313,9 @@ def configure_http_server(
         ),
     ])
 
-    setup_get, setup_post, home_get, health_get = create_web_routes(provider)
+    setup_get, setup_post, health_get = create_web_routes(provider)
     server.custom_route("/auth/setup", methods=["GET"])(setup_get)
     server.custom_route("/auth/setup", methods=["POST"])(setup_post)
-    server.custom_route("/", methods=["GET"])(home_get)
     server.custom_route("/health", methods=["GET"])(health_get)
 
     return provider
