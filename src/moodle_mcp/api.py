@@ -65,6 +65,45 @@ class CourseModule(TypedDict):
     contents: list[dict] | None
 
 
+# ---------------------------------------------------------------------------
+# Course alias mappings for bilingual search (Hungarian / English)
+# ---------------------------------------------------------------------------
+
+COURSE_ALIASES: dict[str, list[str]] = {
+    "operációkutatás": ["operációkutatás", "operations research", "opkut", "vemimam176h", "vemimab244fo"],
+    "operations research": ["operációkutatás", "operations research", "opkut", "vemimam176h", "vemimab244fo"],
+    "opkut": ["operációkutatás", "operations research", "opkut", "vemimam176h", "vemimab244fo"],
+    "kvantitatív": ["kvantitatív", "quantitative", "vegtvem144k"],
+    "kvantitatív módszerek": ["kvantitatív módszerek", "kvantitatív", "quantitative methods", "vegtvem144k"],
+    "quantitative methods": ["kvantitatív módszerek", "kvantitatív", "quantitative methods", "vegtvem144k"],
+    "szövegbányászat": ["szövegbányászat", "text mining", "nlp", "vemisam353s"],
+    "adatbányászat": ["adatbányászat", "data mining", "vemisab254ab"],
+    "gépi tanulás": ["gépi tanulás", "machine learning", "vemisam255n"],
+    "adattárház": ["adattárház", "data warehouse", "vemivim153h"],
+    "adatbázis": ["adatbázis", "database", "vemivim246h"],
+    "hálózatelemzés": ["hálózatelemzés", "network analysis", "vemisam213h"],
+    "rendszertesztelés": ["rendszertesztelés", "system testing", "vemisab154rf"],
+    "mesterséges intelligencia": ["mesterséges intelligencia", "artificial intelligence", "vemisas313mi", "22986"],
+    "üzleti intelligencia": ["üzleti intelligencia", "business intelligence", "vemisam254a"],
+    "adatvizualizáció": ["adatvizualizáció", "data visualization", "vemisam254a", "vemisab133ra"],
+    "riportgenerálás": ["riportgenerálás", "report generation", "vemisab133ra"],
+}
+
+
+def get_search_terms_for_query(query: str | None) -> list[str]:
+    """Expand a query string into matching terms and bilingual aliases."""
+    if not query:
+        return []
+    q = query.lower().strip()
+    terms = [q]
+    for key, aliases in COURSE_ALIASES.items():
+        if key in q or any(a in q for a in aliases):
+            for a in aliases:
+                if a not in terms:
+                    terms.append(a)
+    return terms
+
+
 class CourseSection(TypedDict):
     name: str
     section: int
@@ -396,7 +435,7 @@ def get_upcoming_events() -> list[UpcomingEvent]:
 # ---------------------------------------------------------------------------
 
 
-def get_my_courses() -> list[Course]:
+def get_my_courses(query: str | None = None, active_only: bool = False) -> list[Course]:
     user_id = _get_user_id()
     data = get_moodle_api_data(
         APIFunction.core_enrol_get_users_courses,
@@ -420,21 +459,74 @@ def get_my_courses() -> list[Course]:
 
     courses = glom(data, spec)
     logger.info(f"Extracted {len(courses)} courses")
-    return courses
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    one_and_half_years_ago = now - 550 * 86400
+
+    def _is_active(c: Course) -> bool:
+        not_ended = c.get("enddate", 0) == 0 or c.get("enddate", 0) > now
+        recent = c.get("startdate", 0) == 0 or c.get("startdate", 0) > one_and_half_years_ago
+        name = (c.get("fullname", "") + " " + c.get("shortname", "")).lower()
+        has_current_term = "2026/27" in name or "2026/2027" in name
+        return (not_ended and recent) or has_current_term
+
+    def _course_sort_key(c: Course) -> tuple[int, int]:
+        active_prio = 0 if _is_active(c) else 1
+        return (active_prio, -c.get("startdate", 0))
+
+    sorted_courses = sorted(courses, key=_course_sort_key)
+
+    if active_only:
+        courses_to_filter = [c for c in sorted_courses if _is_active(c)]
+        if not courses_to_filter:
+            courses_to_filter = sorted_courses
+    else:
+        courses_to_filter = sorted_courses
+
+    if not query:
+        return courses_to_filter
+
+    terms = get_search_terms_for_query(query)
+    q_str = query.lower().strip()
+    words = [w for w in re.split(r"\s+", q_str) if len(w) >= 3]
+
+    matched: list[Course] = []
+    for c in courses_to_filter:
+        c_name = (c.get("fullname", "") + " " + c.get("shortname", "")).lower()
+        c_id_str = str(c.get("id"))
+        if c_id_str == q_str:
+            matched.append(c)
+            continue
+        if any(t in c_name for t in terms):
+            matched.append(c)
+            continue
+        if words and any(w in c_name for w in words):
+            matched.append(c)
+
+    if not matched and active_only:
+        for c in sorted_courses:
+            c_name = (c.get("fullname", "") + " " + c.get("shortname", "")).lower()
+            if any(t in c_name for t in terms) or (words and any(w in c_name for w in words)):
+                matched.append(c)
+
+    return matched
 
 
 def get_active_courses() -> list[Course]:
     """Return enrolled courses that are currently active or recent (not ended in past academic years)."""
     courses = get_my_courses()
     now = int(datetime.now(timezone.utc).timestamp())
-    sorted_courses = sorted(courses, key=lambda c: c.get("startdate", 0), reverse=True)
     one_and_half_years_ago = now - 550 * 86400
-    active = [
-        c
-        for c in sorted_courses
-        if (c.get("enddate", 0) == 0 or c.get("enddate", 0) > now)
-        and (c.get("startdate", 0) == 0 or c.get("startdate", 0) > one_and_half_years_ago)
-    ]
+
+    def _is_active(c: Course) -> bool:
+        not_ended = c.get("enddate", 0) == 0 or c.get("enddate", 0) > now
+        recent = c.get("startdate", 0) == 0 or c.get("startdate", 0) > one_and_half_years_ago
+        name = (c.get("fullname", "") + " " + c.get("shortname", "")).lower()
+        has_current_term = "2026/27" in name or "2026/2027" in name
+        return (not_ended and recent) or has_current_term
+
+    sorted_courses = sorted(courses, key=lambda c: c.get("startdate", 0), reverse=True)
+    active = [c for c in sorted_courses if _is_active(c)]
     return active if active else sorted_courses
 
 
@@ -481,15 +573,29 @@ def get_course_content(courseid: int) -> list[CourseSection]:
 _ASSIGNMENTS_CACHE: tuple[float, list[Assignment]] | None = None
 
 
-def get_assignments(courseids: list[int] | None = None) -> list[Assignment]:
+def get_assignments(
+    courseids: list[int] | None = None,
+    query: str | None = None,
+) -> list[Assignment]:
     global _ASSIGNMENTS_CACHE
     now = time.time()
-    if not courseids and _ASSIGNMENTS_CACHE and (now - _ASSIGNMENTS_CACHE[0] < 60):
+    if not courseids and not query and _ASSIGNMENTS_CACHE and (now - _ASSIGNMENTS_CACHE[0] < 60):
         return _ASSIGNMENTS_CACHE[1]
 
+    target_courseids = list(courseids) if courseids else None
+    if query and not target_courseids:
+        try:
+            matched_courses = get_my_courses(query=query)
+            if matched_courses:
+                target_courseids = [c["id"] for c in matched_courses]
+            elif query.strip().isdigit():
+                target_courseids = [int(query.strip())]
+        except Exception as e:
+            logger.warning(f"Could not resolve query '{query}' to courseids: {e}")
+
     params = None
-    if courseids:
-        params = format_moodle_array_params("courseids", courseids)
+    if target_courseids:
+        params = format_moodle_array_params("courseids", target_courseids)
 
     data = get_moodle_api_data(
         APIFunction.mod_assign_get_assignments,
@@ -519,7 +625,32 @@ def get_assignments(courseids: list[int] | None = None) -> list[Assignment]:
             )
 
     logger.info(f"Extracted {len(result)} assignments across {len(courses_data)} courses")
-    if not courseids:
+
+    if query and not courseids:
+        terms = get_search_terms_for_query(query)
+        result = [
+            a for a in result
+            if any(t in a.get("coursename", "").lower() or t in a.get("name", "").lower() for t in terms)
+        ]
+
+    # Sort chronologically:
+    # 1. Upcoming deadlines (ascending by duedate: closest upcoming deadline first!)
+    # 2. Past assignments (descending by duedate: most recent first)
+    # 3. No due date (duedate == 0) at the end
+    now_ts = int(now)
+
+    def _assignment_sort_key(a: Assignment) -> tuple[int, int]:
+        d = a.get("duedate") or 0
+        if d > now_ts:
+            return (0, d)
+        elif d > 0:
+            return (1, -d)
+        else:
+            return (2, 0)
+
+    result.sort(key=_assignment_sort_key)
+
+    if not courseids and not query:
         _ASSIGNMENTS_CACHE = (now, result)
     return result
 
@@ -581,13 +712,23 @@ def get_assignment_status(assignid: int, with_dates: bool = False) -> Assignment
 # ---------------------------------------------------------------------------
 
 
-def get_upcoming_deadlines() -> list[UpcomingDeadline]:
+def get_upcoming_deadlines(course: str | None = None) -> list[UpcomingDeadline]:
     assignments = get_assignments()
     now = int(datetime.now(timezone.utc).timestamp())
 
     # Filter to assignments with future due dates and sort chronologically
-    upcoming = [a for a in assignments if a["duedate"] > now and a["duedate"] > 0]
+    upcoming = [a for a in assignments if (a.get("duedate") or 0) > now]
     upcoming.sort(key=lambda x: x["duedate"])
+
+    if course:
+        terms = get_search_terms_for_query(course)
+        c_str = course.lower().strip()
+        filtered = [
+            a for a in upcoming
+            if any(t in (a.get("coursename") or "").lower() or t in (a.get("name") or "").lower() for t in terms)
+            or str(a.get("courseid")) == c_str
+        ]
+        upcoming = filtered
 
     to_check = upcoming[:5]
 
@@ -635,8 +776,31 @@ def get_upcoming_deadlines() -> list[UpcomingDeadline]:
             }
         )
 
-    # Sort by due date
-    result.sort(key=lambda x: x["duedate"])
+    # If a specific course was requested, also check upcoming calendar events (e.g. quizzes/tests)
+    if course:
+        try:
+            events = get_upcoming_events()
+            terms = get_search_terms_for_query(course)
+            for ev in events:
+                ev_text = (ev.get("name", "") + " " + ev.get("popupname", "") + " " + ev.get("description", "")).lower()
+                if any(t in ev_text for t in terms):
+                    if not any(r["assignment_id"] == ev["id"] for r in result):
+                        result.append(
+                            {
+                                "assignment_id": ev["id"],
+                                "assignment_name": ev.get("name", ""),
+                                "course_name": ev.get("popupname") or course,
+                                "duedate": 0,
+                                "duedate_formatted": ev.get("formattedtime") or "",
+                                "submitted": False,
+                                "submission_status": "event",
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"Could not check calendar events for course '{course}': {e}")
+
+    # Sort by due date (upcoming with duedate first, events/undated at end)
+    result.sort(key=lambda x: (0, x["duedate"]) if x.get("duedate", 0) > 0 else (1, 0))
     logger.info(f"Found {len(result)} upcoming deadlines")
     return result
 
@@ -734,12 +898,13 @@ def search_course_materials(query: str) -> list[SearchResult]:
     """
     needle = query.lower().strip()
     results: list[SearchResult] = []
+    terms = get_search_terms_for_query(query)
 
     all_courses = get_my_courses()
-    # Check if the query directly matches a course name or code
+    # Check if the query directly matches a course name, code, or alias
     name_matches = [
         c for c in all_courses
-        if needle in (c.get("fullname") or "").lower() or needle in (c.get("shortname") or "").lower()
+        if any(t in (c.get("fullname") or "").lower() or t in (c.get("shortname") or "").lower() for t in terms)
     ]
     courses_to_search = name_matches if name_matches else get_active_courses()
     # Cap to at most 5 courses to prevent exceeding Moodle API limits or client timeouts
@@ -766,7 +931,7 @@ def search_course_materials(query: str) -> list[SearchResult]:
                     if isinstance(c, dict)
                 ]
                 haystack = " ".join([course_fullname, name, section_name, *filenames]).lower()
-                if is_name_match or (needle and needle in haystack):
+                if is_name_match or (needle and needle in haystack) or any(t in haystack for t in terms):
                     course_results.append(
                         {
                             "title": name,
@@ -1606,6 +1771,7 @@ _QUESTION_KEYWORDS: dict[str, list[str]] = {
         "deadline", "due", "due date", "overdue", "late", "submit",
         "дедлайн", "завдання",
         "beadandó", "határidő", "mikorra", "leadás", "leadási", "mikor kell",
+        "zárthelyi", "zh", "dolgozat",
     ],
     "grades": [
         "grade", "score", "mark", "result", "gpa",
@@ -1620,7 +1786,7 @@ _QUESTION_KEYWORDS: dict[str, list[str]] = {
     "assignments": [
         "assignment", "homework", "task", "project",
         "робот", "практ",
-        "feladat", "házi", "házi feladat", "beadandó", "projekt", "zh", "dolgozat",
+        "feladat", "házi", "házi feladat", "beadandó", "projekt", "zh", "dolgozat", "zárthelyi",
     ],
     "announcements": [
         "announcement", "news", "notice", "forum", "post",
@@ -1630,12 +1796,14 @@ _QUESTION_KEYWORDS: dict[str, list[str]] = {
     "schedule": [
         "schedule", "calendar", "event", "upcoming", "timetable",
         "розклад",
-        "órarend", "naptár", "esemény", "időpont",
+        "órarend", "naptár", "esemény", "időpont", "mikor lesz", "mikor van",
+        "zh", "zárthelyi", "vizsga", "dolgozat",
     ],
     "search": [
         "search", "find", "look for", "material", "resource",
         "знайти", "пошук",
-        "keres", "keress", "tananyag", "anyag", "jegyzet",
+        "keres", "keress", "tananyag", "anyag", "jegyzet", "tematika", "követelmény",
+        "zárthelyi", "zh", "dolgozat", "vizsga", "teszt", "operációkutatás", "kvantitatív",
     ],
 }
 
@@ -1660,12 +1828,15 @@ def ask_moodle(question: str) -> MoodleAnswer:
     # Fetch data from each source
     if "deadlines" in sources_to_fetch:
         try:
-            deadlines = get_upcoming_deadlines()
+            try:
+                deadlines = get_upcoming_deadlines(course=question)
+            except TypeError:
+                deadlines = get_upcoming_deadlines()
             data_sources_used.append("upcoming_deadlines")
-            # If a specific course name was mentioned in question, prioritize matching items
+            terms = get_search_terms_for_query(question)
             matching_deadlines = [
                 d for d in deadlines
-                if any(term in d["course_name"].lower() for term in question_lower.split() if len(term) > 3)
+                if any(term in d["course_name"].lower() for term in terms)
             ]
             items_to_add = matching_deadlines if matching_deadlines else deadlines[:5]
             for d in items_to_add[:5]:
@@ -1698,9 +1869,15 @@ def ask_moodle(question: str) -> MoodleAnswer:
 
     if "courses" in sources_to_fetch:
         try:
-            courses = get_my_courses()
+            try:
+                matched_courses = get_my_courses(query=question)
+            except TypeError:
+                matched_courses = get_my_courses()
+            if not matched_courses:
+                matched_courses = get_active_courses()
+            courses = matched_courses
             data_sources_used.append("my_courses")
-            for c in courses:
+            for c in courses[:10]:
                 relevant_items.append(
                     {
                         "type": "course",
@@ -1711,7 +1888,7 @@ def ask_moodle(question: str) -> MoodleAnswer:
                         },
                     }
                 )
-            answer_parts.append(f"You are enrolled in {len(courses)} course(s).")
+            answer_parts.append(f"Found {len(courses)} enrolled course(s).")
         except Exception as e:
             answer_parts.append(f"Could not fetch courses: {e}")
 

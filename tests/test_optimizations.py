@@ -239,3 +239,73 @@ def test_execute_parallel_preserves_oauth_context(monkeypatch):
         assert url == "https://moodle.test.edu/webservice/rest/server.php"
         assert token == "test-wstoken"
 
+
+def test_get_my_courses_bilingual_alias(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_courses_raw = [
+        {"id": 37362, "fullname": "Advanced Operations Research [I] (VEMIMAM176H/2026/27/1)", "shortname": "AOR", "startdate": now, "enddate": 0, "category": 1, "progress": 0, "format": "topics"},
+        {"id": 30622, "fullname": "Operációkutatás (VEMIMAB244FO/2025/26/2)", "shortname": "OPKUT", "startdate": now - 300 * 86400, "enddate": 0, "category": 1, "progress": 0, "format": "topics"},
+        {"id": 7542, "fullname": "Kvantitatív módszerek (magyar) (VEGTVEM144K/2026/27/1)", "shortname": "KVANT", "startdate": now, "enddate": 0, "category": 1, "progress": 0, "format": "topics"},
+        {"id": 100, "fullname": "Adatbázisok", "shortname": "DB", "startdate": now, "enddate": 0, "category": 1, "progress": 0, "format": "topics"},
+    ]
+    monkeypatch.setattr(api, "get_moodle_api_data", lambda *a, **kw: mock_courses_raw)
+    monkeypatch.setattr(api, "_get_user_id", lambda: 123)
+
+    # Query in Hungarian "operációkutatás" should find both English & Hungarian courses, with current semester first
+    matched = api.get_my_courses(query="operációkutatás")
+    assert len(matched) == 2
+    assert matched[0]["id"] == 37362
+    assert matched[1]["id"] == 30622
+
+    # Query "kvantitatív"
+    matched_kvant = api.get_my_courses(query="kvantitatív")
+    assert len(matched_kvant) == 1
+    assert matched_kvant[0]["id"] == 7542
+
+
+def test_get_assignments_chronological_sort(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_raw = {
+        "courses": [
+            {
+                "id": 7542,
+                "fullname": "Kvantitatív módszerek",
+                "assignments": [
+                    {"id": 3584, "name": "ARIMA modell", "duedate": now + 200000, "cutoffdate": 0},
+                    {"id": 3572, "name": "K-közép klaszterezés", "duedate": now + 50000, "cutoffdate": 0},
+                    {"id": 3575, "name": "Jövedelem vizsgálat", "duedate": now + 60000, "cutoffdate": 0},
+                    {"id": 1001, "name": "Régi feladat", "duedate": now - 50000, "cutoffdate": 0},
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(api, "get_moodle_api_data", lambda *a, **kw: mock_raw)
+    monkeypatch.setattr(api, "_ASSIGNMENTS_CACHE", None)
+
+    assignments = api.get_assignments(courseids=[7542])
+    # The nearest upcoming deadline must be first (index 0)
+    assert assignments[0]["id"] == 3572
+    assert assignments[1]["id"] == 3575
+    assert assignments[2]["id"] == 3584
+    # Past assignment at the end
+    assert assignments[3]["id"] == 1001
+
+
+def test_get_upcoming_deadlines_course_filter(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_assignments = [
+        {"id": 1, "name": "Task 1", "coursename": "Kvantitatív módszerek (magyar) (VEGTVEM144K/2026/27/1)", "courseid": 7542, "duedate": now + 1000},
+        {"id": 2, "name": "Task 2", "coursename": "Kvantitatív módszerek (magyar) (VEGTVEM144K/2026/27/1)", "courseid": 7542, "duedate": now + 2000},
+        {"id": 3, "name": "Task 3", "coursename": "Más kurzus", "courseid": 9999, "duedate": now + 500},
+    ]
+    monkeypatch.setattr(api, "get_assignments", lambda **kw: mock_assignments)
+    monkeypatch.setattr(api, "get_upcoming_events", lambda: [])
+    monkeypatch.setattr(api, "get_assignment_status", lambda aid, **kw: {"submitted": False, "submission_status": "new"})
+
+    # When filtering by "kvantitatív", Task 3 must be excluded even though its duedate was earlier
+    deadlines = api.get_upcoming_deadlines(course="kvantitatív")
+    assert len(deadlines) == 2
+    assert deadlines[0]["assignment_id"] == 1
+    assert deadlines[1]["assignment_id"] == 2
+
+

@@ -66,8 +66,10 @@ def download_course_file(courseid: int, moduleid: int, filename: str | None = No
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 def search_courses(query: str, page: int = 0, perpage: int = 20) -> enrolment.CourseSearch:
-    """Search the visible Moodle course catalogue, including courses not enrolled in.
+    """Search the public university-wide course catalogue for new courses available for ENROLMENT.
 
+    WARNING: Do NOT use this tool to look up courses the user is already taking or enrolled in;
+    use get_my_courses(query=...) instead!
     Page is zero-based; perpage is 1-100. Returns total matches and enrolment types.
     """
     return enrolment.search_courses(query, page, perpage)
@@ -107,9 +109,14 @@ def get_upcoming_events() -> list[api.UpcomingEvent]:
 
 
 @mcp.tool()
-def get_my_courses() -> list[api.Course]:
-    """Get all courses the current user is enrolled in"""
-    return api.get_my_courses()
+def get_my_courses(query: str | None = None, active_only: bool = False) -> list[api.Course]:
+    """Get courses the current user is enrolled in.
+
+    Use query (e.g. query='operációkutatás' or query='kvantitatív') to find enrolled
+    courses by name, topic, or course code. Active courses are listed first.
+    When looking for enrolled courses, ALWAYS use this tool instead of search_courses.
+    """
+    return api.get_my_courses(query=query, active_only=active_only)
 
 
 @mcp.tool()
@@ -119,9 +126,13 @@ def get_course_content(courseid: int) -> list[api.CourseSection]:
 
 
 @mcp.tool()
-def get_assignments(courseids: list[int] | None = None) -> list[api.Assignment]:
-    """Get assignments and due dates for courses. Returns all enrolled courses' assignments if no course IDs are provided. Preferred tool for finding homework, assignments, and course tasks."""
-    return api.get_assignments(courseids)
+def get_assignments(courseids: list[int] | None = None, query: str | None = None) -> list[api.Assignment]:
+    """Get assignments and due dates for courses, sorted chronologically with next upcoming deadlines first.
+
+    Accepts courseids or a query keyword (e.g. query='kvantitatív' or query='operációkutatás').
+    Preferred tool for finding homework, assignments, and course tasks.
+    """
+    return api.get_assignments(courseids=courseids, query=query)
 
 
 @mcp.tool()
@@ -131,9 +142,13 @@ def get_assignment_status(assignid: int) -> api.AssignmentStatus:
 
 
 @mcp.tool()
-def get_upcoming_deadlines() -> list[api.UpcomingDeadline]:
-    """Get upcoming assignment deadlines across all enrolled courses, sorted chronologically by due date. Preferred tool when asked when an assignment, homework, task, or beadandó is due."""
-    return api.get_upcoming_deadlines()
+def get_upcoming_deadlines(course: str | None = None) -> list[api.UpcomingDeadline]:
+    """Get upcoming assignment deadlines across enrolled courses, sorted chronologically by due date.
+
+    Can be filtered to a specific course by name, keyword, or course ID (e.g. course='kvantitatív' or course='7542').
+    Preferred tool when asked when an assignment, homework, task, or beadandó is due.
+    """
+    return api.get_upcoming_deadlines(course=course)
 
 
 @mcp.tool()
