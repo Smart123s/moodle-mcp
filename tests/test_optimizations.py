@@ -197,3 +197,45 @@ def test_ask_moodle_hungarian_query(monkeypatch):
     assert len(res["relevant_items"]) >= 1
     assert res["relevant_items"][0]["data"]["course_name"] == "Kvantitatív módszerek"
     assert "Szorgalmi feladat" in res["answer"]
+
+
+def test_execute_parallel_preserves_oauth_context(monkeypatch):
+    from mcp.server.auth.middleware.auth_context import AccessToken, AuthenticatedUser, auth_context_var
+    from moodle_mcp import moodle
+
+    # Clear environment & config
+    monkeypatch.delenv("MOODLE_URL", raising=False)
+    monkeypatch.delenv("MOODLE_TOKEN", raising=False)
+    monkeypatch.setattr(moodle, "MOODLE_URL", None)
+    monkeypatch.setattr(moodle, "MOODLE_TOKEN", None)
+    monkeypatch.setattr(moodle, "get_moodle_url", lambda: None)
+    monkeypatch.setattr(moodle, "get_moodle_token", lambda: None)
+
+    # Set up mock OAuth provider
+    class MockProvider:
+        def get_moodle_url_for_access_token(self, token):
+            return "https://moodle.test.edu/webservice/rest/server.php" if token == "valid-token" else None
+
+        def get_moodle_token_for_access_token(self, token):
+            return "test-wstoken" if token == "valid-token" else None
+
+    mock_prov = MockProvider()
+    monkeypatch.setattr("moodle_mcp.auth.get_active_provider", lambda: mock_prov)
+
+    # Simulate request thread with active access token
+    test_token = AccessToken(token="valid-token", client_id="client-1", scopes=["mcp"], expires_at=9999999999)
+    auth_context_var.set(AuthenticatedUser(test_token))
+
+    def worker_check(item):
+        return (
+            moodle.get_active_moodle_url(),
+            moodle.get_active_moodle_token(),
+        )
+
+    # Execute in parallel worker threads
+    results = api.execute_parallel(worker_check, [1, 2, 3])
+    assert len(results) == 3
+    for url, token in results:
+        assert url == "https://moodle.test.edu/webservice/rest/server.php"
+        assert token == "test-wstoken"
+

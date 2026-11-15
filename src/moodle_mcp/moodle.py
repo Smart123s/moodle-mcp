@@ -93,8 +93,13 @@ def format_moodle_array_params(key: str, values: list) -> dict:
     return {f"{key}[{i}]": v for i, v in enumerate(values)}
 
 
+_LAST_ACTIVE_TOKEN: str | None = None
+_LAST_ACTIVE_URL: str | None = None
+
+
 def get_active_moodle_token() -> str | None:
     """Retrieve the Moodle token: prefer the one linked to the active OAuth session, falling back to config/env."""
+    global _LAST_ACTIVE_TOKEN
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
         from .auth import get_active_provider
@@ -104,17 +109,19 @@ def get_active_moodle_token() -> str | None:
             if prov:
                 token = prov.get_moodle_token_for_access_token(acc.token)
                 if token:
+                    _LAST_ACTIVE_TOKEN = token
                     return token
     except Exception:
         pass
 
     import sys
     this_mod = sys.modules.get(__name__)
-    return (getattr(this_mod, "MOODLE_TOKEN", None) if this_mod else None) or get_moodle_token()
+    return (getattr(this_mod, "MOODLE_TOKEN", None) if this_mod else None) or _LAST_ACTIVE_TOKEN or get_moodle_token()
 
 
 def get_active_moodle_url() -> str | None:
     """Retrieve the Moodle base URL: prefer the one linked to the active OAuth session, falling back to config/env."""
+    global _LAST_ACTIVE_URL
     try:
         from mcp.server.auth.middleware.auth_context import get_access_token
         from .auth import get_active_provider
@@ -124,13 +131,14 @@ def get_active_moodle_url() -> str | None:
             if prov:
                 url = prov.get_moodle_url_for_access_token(acc.token)
                 if url:
+                    _LAST_ACTIVE_URL = url
                     return url
     except Exception:
         pass
 
     import sys
     this_mod = sys.modules.get(__name__)
-    return (getattr(this_mod, "MOODLE_URL", None) if this_mod else None) or get_moodle_url()
+    return (getattr(this_mod, "MOODLE_URL", None) if this_mod else None) or _LAST_ACTIVE_URL or get_moodle_url()
 
 
 def get_moodle_api_data(

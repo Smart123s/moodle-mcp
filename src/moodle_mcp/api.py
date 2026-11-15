@@ -1,8 +1,10 @@
+import contextvars
 import re
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from typing import Callable, TypeVar
 from typing_extensions import TypedDict
 
 from glom import Coalesce, glom
@@ -15,6 +17,19 @@ from .moodle import (
     get_moodle_api_data,
 )
 from .utils import to_json_file
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def execute_parallel(func: Callable[[T], R], items: list[T], max_workers: int = 5) -> list[R]:
+    """Execute func(item) concurrently for each item, preserving contextvars (e.g. OAuth access token)."""
+    if not items:
+        return []
+    workers = min(max_workers, len(items))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(contextvars.copy_context().run, func, item) for item in items]
+        return [f.result() for f in futures]
 
 
 # ---------------------------------------------------------------------------
@@ -602,8 +617,7 @@ def get_upcoming_deadlines() -> list[UpcomingDeadline]:
 
     result: list[UpcomingDeadline] = []
     if to_check:
-        with ThreadPoolExecutor(max_workers=min(5, len(to_check))) as executor:
-            result = list(executor.map(_fetch_status, to_check))
+        result = execute_parallel(_fetch_status, to_check, max_workers=5)
 
     # Include any further upcoming assignments without burning additional API calls
     for assign in upcoming[5:]:
@@ -763,11 +777,9 @@ def search_course_materials(query: str) -> list[SearchResult]:
                     )
         return course_results
 
-    max_workers = min(10, max(1, len(courses_to_search)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_search_single_course, c) for c in courses_to_search]
-        for f in as_completed(futures):
-            results.extend(f.result())
+    course_results_lists = execute_parallel(_search_single_course, courses_to_search, max_workers=5)
+    for cr in course_results_lists:
+        results.extend(cr)
 
     logger.info(f"Search for '{query}' matched {len(results)} materials")
     return results
@@ -919,9 +931,8 @@ def get_actionable_tasks() -> list[ActionableTask]:
 
     tasks: list[ActionableTask] = []
     if candidates:
-        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
-            fetched_tasks = executor.map(_check_task, candidates)
-            tasks = [t for t in fetched_tasks if t is not None]
+        fetched_tasks = execute_parallel(_check_task, candidates, max_workers=5)
+        tasks = [t for t in fetched_tasks if t is not None]
 
     # Sort: overdue first, then by due date, no_due_date last
     urgency_order = {
@@ -995,9 +1006,8 @@ def get_overdue_assignments() -> list[OverdueAssignment]:
 
     overdue: list[OverdueAssignment] = []
     if candidates:
-        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
-            checked = executor.map(_check_overdue, candidates)
-            overdue = [o for o in checked if o is not None]
+        checked = execute_parallel(_check_overdue, candidates, max_workers=5)
+        overdue = [o for o in checked if o is not None]
 
     # Sort by days_overdue descending (most overdue first)
     overdue.sort(key=lambda x: x["days_overdue"], reverse=True)
@@ -1059,9 +1069,9 @@ def get_recent_activity(since: int | None = None) -> list[RecentActivity]:
         return course_activities
 
     if target_courses:
-        with ThreadPoolExecutor(max_workers=min(5, len(target_courses))) as executor:
-            for updates in executor.map(_fetch_course_updates, target_courses):
-                activities.extend(updates)
+        updates_lists = execute_parallel(_fetch_course_updates, target_courses, max_workers=5)
+        for updates in updates_lists:
+            activities.extend(updates)
 
     # Fallback supplement: recent grade changes if no updates API data
     if not activities:
@@ -1170,9 +1180,9 @@ def get_course_announcements(courseid: int | None = None) -> list[CourseAnnounce
         return forum_announcements
 
     if target_forums:
-        with ThreadPoolExecutor(max_workers=min(5, len(target_forums))) as executor:
-            for forum_items in executor.map(_fetch_discussions, target_forums):
-                announcements.extend(forum_items)
+        forum_lists = execute_parallel(_fetch_discussions, target_forums, max_workers=5)
+        for forum_items in forum_lists:
+            announcements.extend(forum_items)
 
     # Sort by date descending (newest first)
     announcements.sort(key=lambda x: x["date"], reverse=True)
@@ -1231,9 +1241,8 @@ def get_course_health(courseid: int) -> CourseHealth:
 
     submitted_map: dict[int, bool] = {}
     if candidates:
-        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
-            for aid, is_sub in executor.map(_check_assign_status, candidates):
-                submitted_map[aid] = is_sub
+        for aid, is_sub in execute_parallel(_check_assign_status, candidates, max_workers=5):
+            submitted_map[aid] = is_sub
 
     for assign in assignments:
         aid = assign["id"]
@@ -1339,8 +1348,8 @@ def get_course_progress(courseid: int | None = None) -> list[CourseProgress]:
                     except Exception:
                         return False
 
-                with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
-                    submitted_count = sum(1 for s in executor.map(_check_sub, candidates) if s)
+                sub_statuses = execute_parallel(_check_sub, candidates, max_workers=5)
+                submitted_count = sum(1 for s in sub_statuses if s)
                 completed = submitted_count
                 progress_percentage = round((submitted_count / total) * 100, 1)
         except Exception as inner_e:
@@ -1538,8 +1547,8 @@ def weekly_review() -> WeeklyReview:
                 return False
 
         if candidates:
-            with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
-                submitted_count = sum(1 for s in executor.map(_is_submitted, candidates) if s)
+            sub_statuses = execute_parallel(_is_submitted, candidates, max_workers=5)
+            submitted_count = sum(1 for s in sub_statuses if s)
     except Exception as e:
         logger.warning(f"Failed to fetch assignments for weekly review: {e}")
 
