@@ -120,7 +120,7 @@ def get_course_content(courseid: int) -> list[api.CourseSection]:
 
 @mcp.tool()
 def get_assignments(courseids: list[int] | None = None) -> list[api.Assignment]:
-    """Get assignments for courses. Optionally filter by course IDs. Returns all enrolled courses' assignments if no course IDs are provided."""
+    """Get assignments and due dates for courses. Returns all enrolled courses' assignments if no course IDs are provided. Preferred tool for finding homework, assignments, and course tasks."""
     return api.get_assignments(courseids)
 
 
@@ -132,7 +132,7 @@ def get_assignment_status(assignid: int) -> api.AssignmentStatus:
 
 @mcp.tool()
 def get_upcoming_deadlines() -> list[api.UpcomingDeadline]:
-    """Get upcoming assignment deadlines across all courses, sorted by due date"""
+    """Get upcoming assignment deadlines across all enrolled courses, sorted chronologically by due date. Preferred tool when asked when an assignment, homework, task, or beadandó is due."""
     return api.get_upcoming_deadlines()
 
 
@@ -144,7 +144,7 @@ def get_grades(courseid: int | None = None) -> list[api.CourseGrade] | list[api.
 
 @mcp.tool()
 def search_course_materials(query: str) -> list[api.SearchResult]:
-    """Search across all course materials by query string"""
+    """Search course syllabus sections and uploaded materials/files by keyword. For assignment deadlines and homework due dates, use get_upcoming_deadlines or get_assignments instead."""
     return api.search_course_materials(query)
 
 

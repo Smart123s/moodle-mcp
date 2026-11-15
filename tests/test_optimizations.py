@@ -1,0 +1,199 @@
+from datetime import datetime, timezone
+
+from moodle_mcp import api
+
+
+def test_get_active_courses(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_courses = [
+        {"id": 1, "fullname": "Active Course 1", "shortname": "AC1", "startdate": now - 1000, "enddate": 0, "progress": 50},
+        {"id": 2, "fullname": "Active Course 2", "shortname": "AC2", "startdate": now - 2000, "enddate": now + 50000, "progress": 20},
+        {"id": 3, "fullname": "Old Course", "shortname": "OLD", "startdate": now - 600 * 86400, "enddate": now - 200 * 86400, "progress": 100},
+    ]
+    monkeypatch.setattr(api, "get_my_courses", lambda: mock_courses)
+
+    active = api.get_active_courses()
+    assert len(active) == 2
+    active_ids = [c["id"] for c in active]
+    assert 1 in active_ids
+    assert 2 in active_ids
+    assert 3 not in active_ids
+
+
+def test_search_course_materials_filters_by_course_name(monkeypatch):
+    mock_courses = [
+        {"id": 101, "fullname": "Kvantitatív módszerek", "shortname": "KVANT", "startdate": 1000, "enddate": 0},
+        {"id": 102, "fullname": "Algoritmusok", "shortname": "ALGO", "startdate": 1000, "enddate": 0},
+        {"id": 103, "fullname": "Adatbázisok", "shortname": "DB", "startdate": 1000, "enddate": 0},
+    ]
+    monkeypatch.setattr(api, "get_my_courses", lambda: mock_courses)
+
+    content_calls = []
+
+    def mock_get_content(cid):
+        content_calls.append(cid)
+        return [
+            {
+                "id": 1,
+                "name": "General",
+                "summary": "Course intro",
+                "modules": [{"id": 1, "name": "Syllabus", "modname": "resource", "url": "http://x"}],
+            }
+        ]
+
+    monkeypatch.setattr(api, "get_course_content", mock_get_content)
+
+    results = api.search_course_materials("kvantitatív módszerek")
+    # Only course 101 should be queried because it matched the name directly!
+    assert content_calls == [101]
+    assert len(results) >= 1
+
+
+def test_get_upcoming_deadlines_caps_status_checks(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    # Create 10 upcoming assignments
+    mock_assignments = [
+        {
+            "id": i,
+            "name": f"Assignment {i}",
+            "coursename": "Test Course",
+            "courseid": 1,
+            "duedate": now + 1000 * i,
+        }
+        for i in range(1, 11)
+    ]
+    monkeypatch.setattr(api, "get_assignments", lambda: mock_assignments)
+
+    status_calls = []
+
+    def mock_get_status(assignid, **kwargs):
+        status_calls.append(assignid)
+        return {
+            "assignment_id": assignid,
+            "status": "not_submitted",
+            "submitted": False,
+            "gradingstatus": "notgraded",
+            "graded": False,
+            "canedit": True,
+            "cansubmit": True,
+            "submission_status": None,
+            "time_remaining": 1000,
+            "duedate": now + 1000,
+            "cutoffdate": 0,
+            "extensionduedate": 0,
+            "feedback": None,
+            "grade": None,
+        }
+
+    monkeypatch.setattr(api, "get_assignment_status", mock_get_status)
+
+    deadlines = api.get_upcoming_deadlines()
+    assert len(deadlines) == 10
+    # Status should be fetched for at most 5 items
+    assert len(status_calls) <= 5
+
+
+def test_get_course_progress_all_courses_makes_zero_extra_calls(monkeypatch):
+    mock_courses = [
+        {"id": 1, "fullname": "Course 1", "shortname": "C1", "progress": 85},
+        {"id": 2, "fullname": "Course 2", "shortname": "C2", "progress": 10},
+    ]
+    monkeypatch.setattr(api, "get_my_courses", lambda: mock_courses)
+
+    api_called = []
+
+    def mock_api_call(*args, **kwargs):
+        api_called.append(args)
+        return {}
+
+    monkeypatch.setattr(api, "get_moodle_api_data", mock_api_call)
+
+    progress = api.get_course_progress(None)
+    assert len(progress) == 2
+    assert progress[0]["progress_percentage"] == 85
+    assert progress[1]["progress_percentage"] == 10
+    # No Moodle API calls should have been made
+    assert len(api_called) == 0
+
+
+def test_get_recent_activity_caps_courses(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_courses = [
+        {"id": i, "fullname": f"Course {i}", "shortname": f"C{i}", "startdate": now - 100 * i, "enddate": 0}
+        for i in range(1, 20)
+    ]
+    monkeypatch.setattr(api, "get_active_courses", lambda: mock_courses)
+
+    updates_calls = []
+
+    def mock_api_call(fn, params=None):
+        if fn == api.APIFunction.core_course_get_updates_since:
+            updates_calls.append(params.get("courseid"))
+            return {"instances": []}
+        return {}
+
+    monkeypatch.setattr(api, "get_moodle_api_data", mock_api_call)
+    monkeypatch.setattr(api, "to_json_file", lambda *a, **kw: None)
+    monkeypatch.setattr(api, "_get_course_grades_overview", list)
+
+    api.get_recent_activity()
+    assert len(updates_calls) <= 5
+
+
+def test_get_course_announcements_caps_forums(monkeypatch):
+    mock_courses = [
+        {"id": 1, "fullname": "Course 1", "shortname": "C1", "startdate": 100, "enddate": 0},
+    ]
+    monkeypatch.setattr(api, "get_active_courses", lambda: mock_courses)
+
+    # 10 news forums
+    forums = [{"id": i, "course": 1, "type": "news"} for i in range(1, 11)]
+
+    discussion_calls = []
+
+    def mock_api_call(fn, params=None):
+        if fn == api.APIFunction.mod_forum_get_forums_by_courses:
+            return {"forums": forums}
+        if fn == api.APIFunction.mod_forum_get_forum_discussions:
+            discussion_calls.append(params.get("forumid"))
+            return {"discussions": []}
+        return {}
+
+    monkeypatch.setattr(api, "get_moodle_api_data", mock_api_call)
+    monkeypatch.setattr(api, "to_json_file", lambda *a, **kw: None)
+
+    api.get_course_announcements()
+    assert len(discussion_calls) <= 5
+
+
+def test_ask_moodle_hungarian_query(monkeypatch):
+    now = int(datetime.now(timezone.utc).timestamp())
+    mock_deadlines = [
+        {
+            "assignment_id": 10,
+            "assignment_name": "Szorgalmi feladat",
+            "course_name": "Kvantitatív módszerek",
+            "duedate": now + 86400,
+            "duedate_formatted": "2026-11-25T12:00:00+00:00",
+            "submitted": False,
+            "submission_status": None,
+        },
+        {
+            "assignment_id": 20,
+            "assignment_name": "Másik feladat",
+            "course_name": "Másik tárgy",
+            "duedate": now + 172800,
+            "duedate_formatted": "2026-11-26T12:00:00+00:00",
+            "submitted": False,
+            "submission_status": None,
+        },
+    ]
+    monkeypatch.setattr(api, "get_upcoming_deadlines", lambda: mock_deadlines)
+    monkeypatch.setattr(api, "get_assignments", list)
+    monkeypatch.setattr(api, "get_actionable_tasks", list)
+
+    res = api.ask_moodle("mikorra kell a következő kvantitatív módszerek beadandó?")
+    assert "upcoming_deadlines" in res["data_sources"]
+    assert len(res["relevant_items"]) >= 1
+    assert res["relevant_items"][0]["data"]["course_name"] == "Kvantitatív módszerek"
+    assert "Szorgalmi feladat" in res["answer"]

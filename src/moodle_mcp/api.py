@@ -1,5 +1,7 @@
 import re
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing_extensions import TypedDict
 
@@ -406,6 +408,21 @@ def get_my_courses() -> list[Course]:
     return courses
 
 
+def get_active_courses() -> list[Course]:
+    """Return enrolled courses that are currently active or recent (not ended in past academic years)."""
+    courses = get_my_courses()
+    now = int(datetime.now(timezone.utc).timestamp())
+    sorted_courses = sorted(courses, key=lambda c: c.get("startdate", 0), reverse=True)
+    one_and_half_years_ago = now - 550 * 86400
+    active = [
+        c
+        for c in sorted_courses
+        if (c.get("enddate", 0) == 0 or c.get("enddate", 0) > now)
+        and (c.get("startdate", 0) == 0 or c.get("startdate", 0) > one_and_half_years_ago)
+    ]
+    return active if active else sorted_courses
+
+
 # ---------------------------------------------------------------------------
 # Tool: get_course_content
 # ---------------------------------------------------------------------------
@@ -446,7 +463,15 @@ def get_course_content(courseid: int) -> list[CourseSection]:
 # ---------------------------------------------------------------------------
 
 
+_ASSIGNMENTS_CACHE: tuple[float, list[Assignment]] | None = None
+
+
 def get_assignments(courseids: list[int] | None = None) -> list[Assignment]:
+    global _ASSIGNMENTS_CACHE
+    now = time.time()
+    if not courseids and _ASSIGNMENTS_CACHE and (now - _ASSIGNMENTS_CACHE[0] < 60):
+        return _ASSIGNMENTS_CACHE[1]
+
     params = None
     if courseids:
         params = format_moodle_array_params("courseids", courseids)
@@ -479,6 +504,8 @@ def get_assignments(courseids: list[int] | None = None) -> list[Assignment]:
             )
 
     logger.info(f"Extracted {len(result)} assignments across {len(courses_data)} courses")
+    if not courseids:
+        _ASSIGNMENTS_CACHE = (now, result)
     return result
 
 
@@ -543,14 +570,15 @@ def get_upcoming_deadlines() -> list[UpcomingDeadline]:
     assignments = get_assignments()
     now = int(datetime.now(timezone.utc).timestamp())
 
-    # Filter to assignments with future due dates
+    # Filter to assignments with future due dates and sort chronologically
     upcoming = [a for a in assignments if a["duedate"] > now and a["duedate"] > 0]
+    upcoming.sort(key=lambda x: x["duedate"])
 
-    result: list[UpcomingDeadline] = []
-    for assign in upcoming:
+    to_check = upcoming[:5]
+
+    def _fetch_status(assign: Assignment) -> UpcomingDeadline:
         submitted = False
         submission_status = None
-
         try:
             status = get_assignment_status(assign["id"])
             submitted = status["submitted"]
@@ -560,6 +588,25 @@ def get_upcoming_deadlines() -> list[UpcomingDeadline]:
                 f"Could not get status for assignment {assign['id']}: {e}"
             )
 
+        return {
+            "assignment_id": assign["id"],
+            "assignment_name": assign["name"],
+            "course_name": assign["coursename"],
+            "duedate": assign["duedate"],
+            "duedate_formatted": datetime.fromtimestamp(
+                assign["duedate"], tz=timezone.utc
+            ).isoformat(),
+            "submitted": submitted,
+            "submission_status": submission_status,
+        }
+
+    result: list[UpcomingDeadline] = []
+    if to_check:
+        with ThreadPoolExecutor(max_workers=min(5, len(to_check))) as executor:
+            result = list(executor.map(_fetch_status, to_check))
+
+    # Include any further upcoming assignments without burning additional API calls
+    for assign in upcoming[5:]:
         result.append(
             {
                 "assignment_id": assign["id"],
@@ -569,8 +616,8 @@ def get_upcoming_deadlines() -> list[UpcomingDeadline]:
                 "duedate_formatted": datetime.fromtimestamp(
                     assign["duedate"], tz=timezone.utc
                 ).isoformat(),
-                "submitted": submitted,
-                "submission_status": submission_status,
+                "submitted": False,
+                "submission_status": None,
             }
         )
 
@@ -674,12 +721,26 @@ def search_course_materials(query: str) -> list[SearchResult]:
     needle = query.lower().strip()
     results: list[SearchResult] = []
 
-    for course in get_my_courses():
+    all_courses = get_my_courses()
+    # Check if the query directly matches a course name or code
+    name_matches = [
+        c for c in all_courses
+        if needle in (c.get("fullname") or "").lower() or needle in (c.get("shortname") or "").lower()
+    ]
+    courses_to_search = name_matches if name_matches else get_active_courses()
+    # Cap to at most 5 courses to prevent exceeding Moodle API limits or client timeouts
+    courses_to_search = courses_to_search[:5]
+
+    def _search_single_course(course: Course) -> list[SearchResult]:
+        course_results: list[SearchResult] = []
         try:
             sections = get_course_content(course["id"])
         except MoodleAPIError as e:
             logger.warning(f"Skipping course {course['id']} in search: {e}")
-            continue
+            return course_results
+
+        course_fullname = course.get("fullname") or ""
+        is_name_match = course in name_matches
 
         for section in sections:
             section_name = section.get("name") or ""
@@ -690,16 +751,23 @@ def search_course_materials(query: str) -> list[SearchResult]:
                     for c in (module.get("contents") or [])
                     if isinstance(c, dict)
                 ]
-                haystack = " ".join([name, section_name, *filenames]).lower()
-                if needle and needle in haystack:
-                    results.append(
+                haystack = " ".join([course_fullname, name, section_name, *filenames]).lower()
+                if is_name_match or (needle and needle in haystack):
+                    course_results.append(
                         {
                             "title": name,
                             "url": module.get("url") or "",
                             "content": section_name,
-                            "course_name": course.get("fullname"),
+                            "course_name": course_fullname,
                         }
                     )
+        return course_results
+
+    max_workers = min(10, max(1, len(courses_to_search)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_search_single_course, c) for c in courses_to_search]
+        for f in as_completed(futures):
+            results.extend(f.result())
 
     logger.info(f"Search for '{query}' matched {len(results)} materials")
     return results
@@ -782,14 +850,30 @@ def get_actionable_tasks() -> list[ActionableTask]:
     assignments = get_assignments()
     now = int(datetime.now(timezone.utc).timestamp())
 
-    tasks: list[ActionableTask] = []
+    # Focus on currently relevant assignments (upcoming or recently overdue within last 14 days)
+    active_assignments = [
+        a for a in assignments
+        if a["duedate"] > 0 and (now - 14 * 86400 <= a["duedate"] <= now + 30 * 86400)
+    ]
+    # If no assignments in that 44-day window, fall back to nearest upcoming or recent ones
+    if not active_assignments:
+        active_assignments = sorted(
+            [a for a in assignments if a["duedate"] > 0],
+            key=lambda a: abs(a["duedate"] - now),
+        )
 
-    for assign in assignments:
+    # Sort by urgency: overdue first, then soonest due
+    active_assignments.sort(key=lambda a: (a["duedate"] >= now, a["duedate"]))
+
+    # Cap detailed status fetches at top 5 most urgent candidates
+    candidates = active_assignments[:5]
+
+    def _check_task(assign: Assignment) -> ActionableTask | None:
         try:
             status = get_assignment_status(assign["id"])
         except Exception as e:
             logger.warning(f"Could not get status for assignment {assign['id']}: {e}")
-            continue
+            return None
 
         submitted = status["submitted"]
         graded = status["graded"]
@@ -808,7 +892,7 @@ def get_actionable_tasks() -> list[ActionableTask]:
         elif graded:
             urgency = "recently_graded"
         else:
-            continue  # submitted but not yet graded — no action needed
+            return None  # submitted but not yet graded — no action needed
 
         # Determine status string
         if submitted:
@@ -822,18 +906,22 @@ def get_actionable_tasks() -> list[ActionableTask]:
                 duedate, tz=timezone.utc
             ).isoformat()
 
-        tasks.append(
-            {
-                "id": assign["id"],
-                "name": assign["name"],
-                "course": assign["coursename"],
-                "duedate": duedate,
-                "duedate_formatted": duedate_formatted,
-                "status": task_status,
-                "urgency": urgency,
-                "type": "assignment",
-            }
-        )
+        return {
+            "id": assign["id"],
+            "name": assign["name"],
+            "course": assign["coursename"],
+            "duedate": duedate,
+            "duedate_formatted": duedate_formatted,
+            "status": task_status,
+            "urgency": urgency,
+            "type": "assignment",
+        }
+
+    tasks: list[ActionableTask] = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+            fetched_tasks = executor.map(_check_task, candidates)
+            tasks = [t for t in fetched_tasks if t is not None]
 
     # Sort: overdue first, then by due date, no_due_date last
     urgency_order = {
@@ -864,35 +952,52 @@ def get_overdue_assignments() -> list[OverdueAssignment]:
     assignments = get_assignments()
     now = int(datetime.now(timezone.utc).timestamp())
 
-    overdue: list[OverdueAssignment] = []
-    for assign in assignments:
-        if assign["duedate"] <= 0 or assign["duedate"] >= now:
-            continue
+    # Focus on assignments overdue within the past 30 days
+    past_assignments = [
+        a for a in assignments
+        if a["duedate"] > 0 and (now - 30 * 86400 <= a["duedate"] < now)
+    ]
+    # If no assignments in that 30-day window, take the most recent past ones
+    if not past_assignments:
+        past_assignments = sorted(
+            [a for a in assignments if a["duedate"] > 0 and a["duedate"] < now],
+            key=lambda a: a["duedate"],
+            reverse=True,
+        )
 
+    # Sort by most recently overdue first and take top 5 candidates
+    past_assignments.sort(key=lambda a: a["duedate"], reverse=True)
+    candidates = past_assignments[:5]
+
+    def _check_overdue(assign: Assignment) -> OverdueAssignment | None:
         try:
             status = get_assignment_status(assign["id"])
         except Exception as e:
             logger.warning(f"Could not get status for assignment {assign['id']}: {e}")
-            continue
+            return None
 
         if status["submitted"]:
-            continue
+            return None
 
         days_overdue = (now - assign["duedate"]) // 86400
 
-        overdue.append(
-            {
-                "id": assign["id"],
-                "name": assign["name"],
-                "course": assign["coursename"],
-                "duedate": assign["duedate"],
-                "duedate_formatted": datetime.fromtimestamp(
-                    assign["duedate"], tz=timezone.utc
-                ).isoformat(),
-                "days_overdue": days_overdue,
-                "submission_status": status["submission_status"],
-            }
-        )
+        return {
+            "id": assign["id"],
+            "name": assign["name"],
+            "course": assign["coursename"],
+            "duedate": assign["duedate"],
+            "duedate_formatted": datetime.fromtimestamp(
+                assign["duedate"], tz=timezone.utc
+            ).isoformat(),
+            "days_overdue": days_overdue,
+            "submission_status": status["submission_status"],
+        }
+
+    overdue: list[OverdueAssignment] = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+            checked = executor.map(_check_overdue, candidates)
+            overdue = [o for o in checked if o is not None]
 
     # Sort by days_overdue descending (most overdue first)
     overdue.sort(key=lambda x: x["days_overdue"], reverse=True)
@@ -913,19 +1018,27 @@ def get_recent_activity(since: int | None = None) -> list[RecentActivity]:
 
     activities: list[RecentActivity] = []
 
-    # Primary: try Moodle's course updates API
-    courses = get_my_courses()
-    for course in courses:
+    # Primary: try Moodle's course updates API on active courses (max 5)
+    active_courses = get_active_courses()
+    # Filter courses that haven't ended before 'since'
+    candidate_courses = [
+        c for c in active_courses
+        if c.get("enddate", 0) == 0 or c.get("enddate", 0) > since
+    ]
+    # Cap at top 5 most recent courses to avoid excessive sequential API calls
+    target_courses = candidate_courses[:5]
+
+    def _fetch_course_updates(course: Course) -> list[RecentActivity]:
+        course_activities: list[RecentActivity] = []
         try:
             data = get_moodle_api_data(
                 APIFunction.core_course_get_updates_since,
                 params={"courseid": str(course["id"]), "since": str(since)},
             )
             to_json_file(data, f"course_updates_{course['id']}.json")
-            # Parse updates from response
             instances = data.get("instances", []) if isinstance(data, dict) else []
             for inst in instances:
-                activities.append(
+                course_activities.append(
                     {
                         "course": course["fullname"],
                         "type": "update",
@@ -941,10 +1054,14 @@ def get_recent_activity(since: int | None = None) -> list[RecentActivity]:
             logger.warning(
                 f"Course updates API unavailable for course {course['id']}: {e}"
             )
-            continue
         except Exception as e:
             logger.warning(f"Unexpected error for course {course['id']}: {e}")
-            continue
+        return course_activities
+
+    if target_courses:
+        with ThreadPoolExecutor(max_workers=min(5, len(target_courses))) as executor:
+            for updates in executor.map(_fetch_course_updates, target_courses):
+                activities.extend(updates)
 
     # Fallback supplement: recent grade changes if no updates API data
     if not activities:
@@ -982,16 +1099,17 @@ def get_course_announcements(courseid: int | None = None) -> list[CourseAnnounce
     """Gets announcements from course news forums."""
     announcements: list[CourseAnnouncement] = []
 
-    # Step 1: Get course IDs and name map
+    # Step 1: Get course IDs and name map (target active courses if courseid is None)
     if courseid:
-        course_ids = [courseid]
-        # Get the course name
-        courses = get_my_courses()
-        course_map = {c["id"]: c["fullname"] for c in courses if c["id"] == courseid}
+        courses = [c for c in get_my_courses() if c["id"] == courseid]
     else:
-        courses = get_my_courses()
-        course_ids = [c["id"] for c in courses]
-        course_map = {c["id"]: c["fullname"] for c in courses}
+        courses = get_active_courses()
+
+    course_ids = [c["id"] for c in courses]
+    course_map = {c["id"]: c["fullname"] for c in courses}
+
+    if not course_ids:
+        return announcements
 
     # Step 2: Get forums for courses
     params = format_moodle_array_params("courseids", course_ids)
@@ -1009,50 +1127,52 @@ def get_course_announcements(courseid: int | None = None) -> list[CourseAnnounce
     # Handle both dict and list response formats
     forums_list = forums_data if isinstance(forums_data, list) else forums_data.get("forums", [])
 
-    # Step 3: Find news/announcement forums (type "news")
-    for forum in forums_list:
-        forum_type = forum.get("type", "")
-        if forum_type != "news":
-            continue
+    # Step 3: Find news/announcement forums (type "news"), capped at top 5 to avoid excessive API calls
+    news_forums = [f for f in forums_list if f.get("type") == "news"]
+    target_forums = news_forums[:5]
 
+    def _fetch_discussions(forum: dict) -> list[CourseAnnouncement]:
+        forum_announcements: list[CourseAnnouncement] = []
         forum_id = forum.get("id", 0)
-        course_id = forum.get("course", 0)
-        course_name = course_map.get(course_id, "")
+        c_id = forum.get("course", 0)
+        c_name = course_map.get(c_id, "")
 
-        # Step 4: Get discussions from this forum
         try:
             discussions_data = get_moodle_api_data(
                 APIFunction.mod_forum_get_forum_discussions,
-                # page defaults to -1; Moodle computes the offset as page * perpage
                 params={"forumid": str(forum_id), "page": "0", "perpage": "20"},
             )
-        except MoodleAPIError as e:
-            logger.warning(f"Could not get discussions for forum {forum_id}: {e}")
-            continue
-
-        to_json_file(discussions_data, f"forum_discussions_{forum_id}.json")
-
-        discussion_list = discussions_data.get("discussions", []) if isinstance(discussions_data, dict) else discussions_data
-        for disc in discussion_list:
-            # Strip HTML tags from message for cleaner output
-            message = disc.get("message", "")
-            message = re.sub(r"<[^>]+>", "", message).strip()
-
-            created = disc.get("created", 0) or disc.get("timemodified", 0)
-
-            announcements.append(
-                {
-                    "id": disc.get("id", 0),
-                    "subject": disc.get("subject", ""),
-                    "message": message,
-                    "course": course_name,
-                    "author": disc.get("userfullname", ""),
-                    "date": created,
-                    "date_formatted": datetime.fromtimestamp(
-                        created, tz=timezone.utc
-                    ).isoformat() if created > 0 else "",
-                }
+            to_json_file(discussions_data, f"forum_discussions_{forum_id}.json")
+            discussion_list = (
+                discussions_data.get("discussions", [])
+                if isinstance(discussions_data, dict)
+                else discussions_data
             )
+            for disc in discussion_list:
+                message = disc.get("message", "")
+                message = re.sub(r"<[^>]+>", "", message).strip()
+                created = disc.get("created", 0) or disc.get("timemodified", 0)
+                forum_announcements.append(
+                    {
+                        "id": disc.get("id", 0),
+                        "subject": disc.get("subject", ""),
+                        "message": message,
+                        "course": c_name,
+                        "author": disc.get("userfullname", ""),
+                        "date": created,
+                        "date_formatted": datetime.fromtimestamp(
+                            created, tz=timezone.utc
+                        ).isoformat() if created > 0 else "",
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Could not get discussions for forum {forum_id}: {e}")
+        return forum_announcements
+
+    if target_forums:
+        with ThreadPoolExecutor(max_workers=min(5, len(target_forums))) as executor:
+            for forum_items in executor.map(_fetch_discussions, target_forums):
+                announcements.extend(forum_items)
 
     # Sort by date descending (newest first)
     announcements.sort(key=lambda x: x["date"], reverse=True)
@@ -1095,13 +1215,30 @@ def get_course_health(courseid: int) -> CourseHealth:
     unsubmitted_count = 0
     overdue_count = 0
 
-    for assign in assignments:
-        try:
-            status = get_assignment_status(assign["id"])
-        except Exception:
-            continue
+    # Sort assignments by urgency (overdue or near-term first)
+    # Check at most 5 assignment statuses concurrently to avoid excessive calls
+    candidates = sorted(
+        assignments,
+        key=lambda a: (a["duedate"] <= 0, abs(a["duedate"] - now)),
+    )[:5]
 
-        if not status["submitted"]:
+    def _check_assign_status(a: Assignment) -> tuple[int, bool]:
+        try:
+            status = get_assignment_status(a["id"])
+            return a["id"], status["submitted"]
+        except Exception:
+            return a["id"], False
+
+    submitted_map: dict[int, bool] = {}
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+            for aid, is_sub in executor.map(_check_assign_status, candidates):
+                submitted_map[aid] = is_sub
+
+    for assign in assignments:
+        aid = assign["id"]
+        is_sub = submitted_map.get(aid, False)
+        if not is_sub:
             unsubmitted_count += 1
             if assign["duedate"] > 0 and assign["duedate"] < now:
                 overdue_count += 1
@@ -1145,67 +1282,80 @@ def get_course_health(courseid: int) -> CourseHealth:
 
 def get_course_progress(courseid: int | None = None) -> list[CourseProgress]:
     """Progress/completion for courses. Optionally specify a course ID, or get all courses."""
-    user_id = _get_user_id()
     results: list[CourseProgress] = []
 
-    if courseid:
-        courses = [c for c in get_my_courses() if c["id"] == courseid]
-    else:
+    if courseid is None:
+        # Avoid looping over all enrolled courses (which would trigger dozens of sequential API calls).
+        # get_my_courses() already provides progress per course from the timeline classification API!
         courses = get_my_courses()
-
-    for course in courses:
-        cid = course["id"]
-        progress_percentage = course.get("progress")
-        completed = 0
-        total = 0
-
-        # Try official completion status API
-        try:
-            data = get_moodle_api_data(
-                APIFunction.core_completion_get_course_completion_status,
-                params={"courseid": str(cid), "userid": str(user_id)},
+        for course in courses:
+            results.append(
+                {
+                    "courseid": course["id"],
+                    "coursename": course["fullname"],
+                    "progress_percentage": course.get("progress"),
+                    "completed_activities": 0,
+                    "total_activities": 0,
+                }
             )
-            to_json_file(data, f"completion_{cid}.json")
-            # Response structure varies; try common fields
-            completion_status = data.get("completed", False)
-            statuses = data.get("status", []) if isinstance(data, dict) else []
-            total = len(statuses)
-            completed = sum(1 for s in statuses if s.get("complete", False))
-            if total > 0:
-                progress_percentage = round((completed / total) * 100, 1)
-        except MoodleAPIError as e:
-            logger.warning(f"Completion API unavailable for course {cid}: {e}")
-            # Fallback: calculate from assignment submissions
-            try:
-                assignments = get_assignments(courseids=[cid])
-                total = len(assignments)
-                if total == 0:
-                    completed = 0
-                else:
-                    submitted_count = 0
-                    for a in assignments:
-                        try:
-                            s = get_assignment_status(a["id"])
-                            if s["submitted"]:
-                                submitted_count += 1
-                        except Exception:
-                            pass
-                    completed = submitted_count
-                    progress_percentage = round((submitted_count / total) * 100, 1)
-            except Exception as inner_e:
-                logger.warning(f"Fallback progress calc failed for course {cid}: {inner_e}")
+        logger.info(f"Reported progress for {len(results)} courses from course list")
+        return results
 
-        results.append(
-            {
-                "courseid": cid,
-                "coursename": course["fullname"],
-                "progress_percentage": progress_percentage,
-                "completed_activities": completed,
-                "total_activities": total,
-            }
+    # Specific course requested
+    user_id = _get_user_id()
+    courses = [c for c in get_my_courses() if c["id"] == courseid]
+    course = courses[0] if courses else None
+    if not course:
+        return results
+
+    cid = course["id"]
+    progress_percentage = course.get("progress")
+    completed = 0
+    total = 0
+
+    # Try official completion status API
+    try:
+        data = get_moodle_api_data(
+            APIFunction.core_completion_get_course_completion_status,
+            params={"courseid": str(cid), "userid": str(user_id)},
         )
+        to_json_file(data, f"completion_{cid}.json")
+        statuses = data.get("status", []) if isinstance(data, dict) else []
+        total = len(statuses)
+        completed = sum(1 for s in statuses if s.get("complete", False))
+        if total > 0:
+            progress_percentage = round((completed / total) * 100, 1)
+    except MoodleAPIError as e:
+        logger.warning(f"Completion API unavailable for course {cid}: {e}")
+        # Fallback: calculate from assignment submissions (cap checks at 5)
+        try:
+            assignments = get_assignments(courseids=[cid])
+            total = len(assignments)
+            if total > 0:
+                candidates = assignments[:5]
+                def _check_sub(a: Assignment) -> bool:
+                    try:
+                        return get_assignment_status(a["id"])["submitted"]
+                    except Exception:
+                        return False
 
-    logger.info(f"Calculated progress for {len(results)} courses")
+                with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+                    submitted_count = sum(1 for s in executor.map(_check_sub, candidates) if s)
+                completed = submitted_count
+                progress_percentage = round((submitted_count / total) * 100, 1)
+        except Exception as inner_e:
+            logger.warning(f"Fallback progress calc failed for course {cid}: {inner_e}")
+
+    results.append(
+        {
+            "courseid": cid,
+            "coursename": course["fullname"],
+            "progress_percentage": progress_percentage,
+            "completed_activities": completed,
+            "total_activities": total,
+        }
+    )
+    logger.info(f"Calculated progress for course {cid}")
     return results
 
 
@@ -1371,18 +1521,25 @@ def weekly_review() -> WeeklyReview:
         week_end.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     )
 
-    # Submitted count this week
+    # Submitted count this week (cap status checks at top 5)
     submitted_count = 0
     try:
         assignments = get_assignments()
-        for a in assignments:
-            if a["duedate"] > 0 and week_start_ts <= a["duedate"] < week_end_ts:
-                try:
-                    status = get_assignment_status(a["id"])
-                    if status["submitted"]:
-                        submitted_count += 1
-                except Exception:
-                    pass
+        week_assignments = [
+            a for a in assignments
+            if a["duedate"] > 0 and week_start_ts <= a["duedate"] < week_end_ts
+        ]
+        candidates = week_assignments[:5]
+
+        def _is_submitted(a: Assignment) -> bool:
+            try:
+                return get_assignment_status(a["id"])["submitted"]
+            except Exception:
+                return False
+
+        if candidates:
+            with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+                submitted_count = sum(1 for s in executor.map(_is_submitted, candidates) if s)
     except Exception as e:
         logger.warning(f"Failed to fetch assignments for weekly review: {e}")
 
@@ -1436,13 +1593,41 @@ def weekly_review() -> WeeklyReview:
 # ---------------------------------------------------------------------------
 
 _QUESTION_KEYWORDS: dict[str, list[str]] = {
-    "deadlines": ["deadline", "due", "due date", "overdue", "late", "submit", "дедлайн", "завдання"],
-    "grades": ["grade", "score", "mark", "result", "gpa", "оцінк", "бал"],
-    "courses": ["course", "class", "enroll", "progress", "курс", "предмет"],
-    "assignments": ["assignment", "homework", "task", "project", "робот", "практ"],
-    "announcements": ["announcement", "news", "notice", "forum", "post", "оголошення", "новин"],
-    "schedule": ["schedule", "calendar", "event", "upcoming", "timetable", "розклад"],
-    "search": ["search", "find", "look for", "material", "resource", "знайти", "пошук"],
+    "deadlines": [
+        "deadline", "due", "due date", "overdue", "late", "submit",
+        "дедлайн", "завдання",
+        "beadandó", "határidő", "mikorra", "leadás", "leadási", "mikor kell",
+    ],
+    "grades": [
+        "grade", "score", "mark", "result", "gpa",
+        "оцінк", "бал",
+        "jegy", "osztályzat", "eredmény", "pontszám", "értékelés",
+    ],
+    "courses": [
+        "course", "class", "enroll", "progress",
+        "курс", "предмет",
+        "kurzus", "tárgy", "tantárgy", "órák",
+    ],
+    "assignments": [
+        "assignment", "homework", "task", "project",
+        "робот", "практ",
+        "feladat", "házi", "házi feladat", "beadandó", "projekt", "zh", "dolgozat",
+    ],
+    "announcements": [
+        "announcement", "news", "notice", "forum", "post",
+        "оголошення", "новин",
+        "hír", "hirdetmény", "értesítés", "fórum",
+    ],
+    "schedule": [
+        "schedule", "calendar", "event", "upcoming", "timetable",
+        "розклад",
+        "órarend", "naptár", "esemény", "időpont",
+    ],
+    "search": [
+        "search", "find", "look for", "material", "resource",
+        "знайти", "пошук",
+        "keres", "keress", "tananyag", "anyag", "jegyzet",
+    ],
 }
 
 
@@ -1468,9 +1653,21 @@ def ask_moodle(question: str) -> MoodleAnswer:
         try:
             deadlines = get_upcoming_deadlines()
             data_sources_used.append("upcoming_deadlines")
-            for d in deadlines[:5]:
+            # If a specific course name was mentioned in question, prioritize matching items
+            matching_deadlines = [
+                d for d in deadlines
+                if any(term in d["course_name"].lower() for term in question_lower.split() if len(term) > 3)
+            ]
+            items_to_add = matching_deadlines if matching_deadlines else deadlines[:5]
+            for d in items_to_add[:5]:
                 relevant_items.append({"type": "deadline", "data": d})
-            if deadlines:
+            if matching_deadlines:
+                detail = ", ".join(
+                    f"'{d['assignment_name']}' ({d['course_name']}) due {d['duedate_formatted']}"
+                    for d in matching_deadlines[:3]
+                )
+                answer_parts.append(f"Upcoming deadline for your query: {detail}.")
+            elif deadlines:
                 answer_parts.append(f"You have {len(deadlines)} upcoming deadline(s).")
             else:
                 answer_parts.append("You have no upcoming deadlines.")
@@ -1547,7 +1744,7 @@ def ask_moodle(question: str) -> MoodleAnswer:
     if "search" in sources_to_fetch:
         # Extract a search query from the question
         search_query = question_lower
-        for word in ["search", "find", "look for", "знайти", "пошук"]:
+        for word in ["search", "find", "look for", "знайти", "пошук", "keress", "keres", "hol van", "mikor van"]:
             search_query = search_query.replace(word, "")
         search_query = search_query.strip()
         if search_query:

@@ -264,6 +264,8 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 f"Rejecting client registration: maximum clients limit reached ({max_clients})"
             )
             raise ValueError(f"Maximum number of registered OAuth clients reached ({max_clients})")
+        if client_info.grant_types and "refresh_token" not in client_info.grant_types:
+            client_info.grant_types.append("refresh_token")
         self.clients[client_info.client_id] = client_info
         self._save_store()
         logger.info(f"Registered OAuth client: {client_info.client_id}")
