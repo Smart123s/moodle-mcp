@@ -309,3 +309,69 @@ def test_get_upcoming_deadlines_course_filter(monkeypatch):
     assert deadlines[1]["assignment_id"] == 2
 
 
+def test_get_course_content_extracts_description_and_summary(monkeypatch):
+    mock_raw = [
+        {
+            "id": 10,
+            "name": "General",
+            "section": 0,
+            "visible": 1,
+            "uservisible": True,
+            "summary": "<p>Course introductory overview.</p>",
+            "modules": [
+                {
+                    "id": 621041,
+                    "name": "General Infos",
+                    "modname": "label",
+                    "url": None,
+                    "description": "<p dir=\"ltr\">On the 13th week of the semester, an in-class assessment is written, separately from the two parts. Each part contributes 50% to the final grade.</p>",
+                    "contents": None,
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(api, "get_moodle_api_data", lambda *a, **kw: mock_raw)
+
+    sections = api.get_course_content(37362)
+    assert len(sections) == 1
+    assert sections[0]["summary"] == "Course introductory overview."
+    mod = sections[0]["modules"][0]
+    assert mod["name"] == "General Infos"
+    assert mod["modname"] == "label"
+    assert "13th week of the semester" in mod["description"]
+    assert "in-class assessment" in mod["description"]
+    assert "<p" not in mod["description"]
+
+
+def test_search_course_materials_matches_label_description(monkeypatch):
+    mock_courses = [
+        {"id": 37362, "fullname": "Advanced Operations Research [I] (VEMIMAM176H/2026/27/1)", "shortname": "AOR", "startdate": 1000, "enddate": 0},
+    ]
+    monkeypatch.setattr(api, "get_my_courses", lambda *a, **kw: mock_courses)
+
+    mock_content = [
+        {
+            "name": "General",
+            "section": 0,
+            "summary": None,
+            "modules": [
+                {
+                    "id": 621041,
+                    "name": "General Infos",
+                    "modname": "label",
+                    "url": None,
+                    "description": "On the 13th week of the semester, an in-class assessment is written, separately from the two parts.",
+                    "contents": None,
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(api, "get_course_content", lambda cid: mock_content)
+
+    results = api.search_course_materials("13th week assessment")
+    assert len(results) == 1
+    assert results[0]["title"] == "General Infos"
+    assert "13th week of the semester" in results[0]["content"]
+
+
+

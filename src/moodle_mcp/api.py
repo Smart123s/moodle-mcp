@@ -62,6 +62,7 @@ class CourseModule(TypedDict):
     name: str
     modname: str
     url: str | None
+    description: str | None
     contents: list[dict] | None
 
 
@@ -104,11 +105,28 @@ def get_search_terms_for_query(query: str | None) -> list[str]:
     return terms
 
 
+def _clean_html(raw_html: str | None) -> str | None:
+    """Strip HTML tags and unescape entities into clean readable text."""
+    if not raw_html:
+        return None
+    import html as html_lib
+    text = re.sub(r"(?i)<br\s*/?>", "\n", raw_html)
+    text = re.sub(r"(?i)</p>", "\n", text)
+    text = re.sub(r"(?i)</div>", "\n", text)
+    text = re.sub(r"(?i)</li>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    return text or None
+
+
 class CourseSection(TypedDict):
     name: str
     section: int
     visible: int
     uservisible: bool
+    summary: str | None
     modules: list[CourseModule]
 
 
@@ -549,6 +567,7 @@ def get_course_content(courseid: int) -> list[CourseSection]:
         "name": "name",
         "modname": "modname",
         "url": Coalesce("url", default=None),
+        "description": Coalesce("description", default=None),
         "contents": Coalesce("contents", default=None),
     }
 
@@ -557,10 +576,20 @@ def get_course_content(courseid: int) -> list[CourseSection]:
         "section": "section",
         "visible": Coalesce("visible", default=1),
         "uservisible": Coalesce("uservisible", default=True),
+        "summary": Coalesce("summary", default=None),
         "modules": (Coalesce("modules", default=[]), [module_spec]),
     }
 
     sections = glom(data, [section_spec])
+
+    # Clean HTML from summaries and module descriptions
+    for s in sections:
+        if s.get("summary"):
+            s["summary"] = _clean_html(s["summary"])
+        for m in s.get("modules", []):
+            if m.get("description"):
+                m["description"] = _clean_html(m["description"])
+
     logger.info(f"Extracted {len(sections)} sections for course {courseid}")
     return sections
 
@@ -921,22 +950,33 @@ def search_course_materials(query: str) -> list[SearchResult]:
         course_fullname = course.get("fullname") or ""
         is_name_match = course in name_matches
 
+        words = [w for w in re.split(r"\s+", needle) if len(w) >= 3]
+
         for section in sections:
             section_name = section.get("name") or ""
+            section_summary = section.get("summary") or ""
             for module in section.get("modules", []):
                 name = module.get("name") or ""
+                description = module.get("description") or ""
                 filenames = [
                     c.get("filename", "")
                     for c in (module.get("contents") or [])
                     if isinstance(c, dict)
                 ]
-                haystack = " ".join([course_fullname, name, section_name, *filenames]).lower()
-                if is_name_match or (needle and needle in haystack) or any(t in haystack for t in terms):
+                haystack = " ".join([course_fullname, name, section_name, section_summary, description, *filenames]).lower()
+                word_match = bool(words) and all(w in haystack for w in words)
+                term_match = any(t in haystack for t in terms)
+                if is_name_match or (needle and needle in haystack) or word_match or term_match:
+                    content_parts = [section_name]
+                    if description:
+                        content_parts.append(description)
+                    elif section_summary:
+                        content_parts.append(section_summary)
                     course_results.append(
                         {
                             "title": name,
                             "url": module.get("url") or "",
-                            "content": section_name,
+                            "content": ": ".join(content_parts),
                             "course_name": course_fullname,
                         }
                     )
