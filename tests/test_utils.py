@@ -71,3 +71,34 @@ def test_invalid_target_does_not_raise(monkeypatch, tmp_path, caplog):
         to_json_file({"a": 1}, "data.json")
 
     assert "Could not write debug file" in caplog.text
+
+
+def test_healthcheck_filter():
+    from moodle_mcp.logger import HealthCheckFilter
+
+    health_filter = HealthCheckFilter()
+
+    # Uvicorn access log style records with args tuple
+    rec_health = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "",
+        0,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1", "GET", "/health", "1.1", 200),
+        None,
+    )
+    rec_mcp = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "",
+        0,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1", "POST", "/mcp", "1.1", 200),
+        None,
+    )
+
+    assert health_filter.filter(rec_health) is False
+    assert health_filter.filter(rec_mcp) is True
+
+
