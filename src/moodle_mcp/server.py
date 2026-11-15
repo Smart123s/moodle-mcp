@@ -275,13 +275,19 @@ def configure_http_server(
     set_active_provider(provider)
     token_verifier = ProviderTokenVerifier(provider)
 
+    registration_options = ClientRegistrationOptions(
+        enabled=True,
+        valid_scopes=["mcp", "openid"],
+        default_scopes=["mcp", "openid"],
+    )
+
     server._auth_server_provider = provider
     server._token_verifier = token_verifier
     server.settings.auth = AuthSettings(
         issuer_url=public_url_str,
         resource_server_url=f"{public_url_str}/mcp",
         validate_token_resource=False,
-        client_registration_options=ClientRegistrationOptions(enabled=True),
+        client_registration_options=registration_options,
     )
 
     # Remove previously registered custom routes with the same paths to allow re-configuration
@@ -302,7 +308,7 @@ def configure_http_server(
     client_authenticator = ClientAuthenticator(provider)
     token_handler = TokenHandler(provider, client_authenticator)
     auth_handler = AuthorizationHandler(provider)
-    registration_handler = RegistrationHandler(provider, ClientRegistrationOptions(enabled=True))
+    registration_handler = RegistrationHandler(provider, registration_options)
 
     # Register standard OAuth/OIDC endpoint aliases for Gemini Web
     server._custom_starlette_routes.extend([

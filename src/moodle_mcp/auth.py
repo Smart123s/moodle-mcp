@@ -92,6 +92,17 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         """Get the Moodle base URL linked to a specific OAuth access token."""
         return self.token_moodle_urls.get(access_token)
 
+    @staticmethod
+    def _normalize_client_scopes(client: OAuthClientInformationFull) -> None:
+        """Ensure client has standard MCP and OpenID scopes enabled."""
+        if not client.scope:
+            client.scope = "mcp openid"
+        else:
+            scopes = set(client.scope.split())
+            if not {"mcp", "openid"}.issubset(scopes):
+                scopes.update(["mcp", "openid"])
+                client.scope = " ".join(sorted(scopes))
+
     def _init_default_clients(self) -> None:
         """Pre-configure default clients such as Gemini if configured via env."""
         gemini_client_id = os.getenv("GEMINI_CLIENT_ID", "gemini")
@@ -109,6 +120,7 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 token_endpoint_auth_method="client_secret_post" if gemini_client_secret else "none",
                 grant_types=["authorization_code", "refresh_token"],
                 response_types=["code"],
+                scope="mcp openid",
             )
 
     def _load_store(self) -> None:
@@ -123,6 +135,7 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             for client_data in data.get("clients", []):
                 try:
                     client = OAuthClientInformationFull.model_validate(client_data)
+                    self._normalize_client_scopes(client)
                     self.clients[client.client_id] = client
                 except Exception as e:
                     logger.warning(f"Failed to load client from store: {e}")
@@ -246,13 +259,18 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         Also supports dynamic fallback for Gemini OAuth redirect requests.
         """
         if client_id in self.clients:
-            return self.clients[client_id]
+            client = self.clients[client_id]
+            self._normalize_client_scopes(client)
+            return client
 
         # Check environment variable configured client
         env_client_id = os.getenv("GEMINI_CLIENT_ID")
         if env_client_id and client_id == env_client_id:
             self._init_default_clients()
-            return self.clients.get(client_id)
+            client = self.clients.get(client_id)
+            if client:
+                self._normalize_client_scopes(client)
+            return client
 
         return None
 
@@ -266,6 +284,7 @@ class MoodleOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             raise ValueError(f"Maximum number of registered OAuth clients reached ({max_clients})")
         if client_info.grant_types and "refresh_token" not in client_info.grant_types:
             client_info.grant_types.append("refresh_token")
+        self._normalize_client_scopes(client_info)
         self.clients[client_info.client_id] = client_info
         self._save_store()
         logger.info(f"Registered OAuth client: {client_info.client_id}")

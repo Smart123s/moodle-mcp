@@ -500,3 +500,83 @@ def test_setup_flow_with_custom_moodle_url(tmp_path, monkeypatch):
         assert provider.get_moodle_url_for_access_token(tokens.access_token) == "https://moodle.custom.edu/webservice/rest/server.php"
 
 
+def test_chatgpt_dynamic_registration_and_openid_authorization(tmp_path, monkeypatch):
+    """Verify ChatGPT OAuth flow: DCR registration without scope, followed by /authorize with scope=openid."""
+    cfg_file = tmp_path / "credentials.json"
+    oauth_file = tmp_path / "oauth_store.json"
+    monkeypatch.setenv("CREDENTIALS_PATH", str(cfg_file))
+    monkeypatch.setenv("OAUTH_STORE_PATH", str(oauth_file))
+    config._CACHED_CONFIG = None
+
+    public_url = "https://moodle-mcp.tmbpeter.hu"
+    provider = configure_http_server(mcp, public_url=public_url)
+    app = mcp.streamable_http_app(host="127.0.0.1")
+    client = TestClient(app)
+
+    # 1. ChatGPT registers dynamically without specifying scope
+    reg_payload = {
+        "client_name": "ChatGPT",
+        "redirect_uris": ["https://chatgpt.com/connector/oauth/Au_rXGjxzzsE"],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }
+    r_reg = client.post("/register", json=reg_payload)
+    assert r_reg.status_code == 201
+    reg_data = r_reg.json()
+    chatgpt_client_id = reg_data["client_id"]
+    assert "openid" in reg_data.get("scope", "")
+
+    # 2. ChatGPT calls /authorize with scope=openid
+    r_auth = client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": chatgpt_client_id,
+            "redirect_uri": "https://chatgpt.com/connector/oauth/Au_rXGjxzzsE",
+            "scope": "openid",
+            "code_challenge": "8RVTCK4nh7xOIYJhTW4neZ0XiD3_mAbpD47Bd7SsyKU",
+            "code_challenge_method": "S256",
+            "state": "oauth_state_chatgpt",
+        },
+        follow_redirects=False,
+    )
+    # Must succeed with 302 redirecting to /auth/setup, NOT invalid_scope
+    assert r_auth.status_code == 302
+    location = r_auth.headers["location"]
+    assert location.startswith("/auth/setup?session_id=")
+    assert "error=" not in location
+
+
+def test_client_scope_normalization_for_legacy_store(tmp_path, monkeypatch):
+    """Verify that clients previously persisted with scope=null (e.g. existing ChatGPT registration)
+    are automatically normalized to support both mcp and openid scopes."""
+    oauth_file = tmp_path / "oauth_store.json"
+    legacy_data = {
+        "clients": [
+            {
+                "client_id": "legacy-chatgpt-id",
+                "client_name": "ChatGPT",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/legacy"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "scope": None,
+            }
+        ],
+        "access_tokens": [],
+        "refresh_tokens": [],
+    }
+    oauth_file.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    provider = MoodleOAuthProvider(store_path=oauth_file)
+    import anyio
+    loaded_client = anyio.run(provider.get_client, "legacy-chatgpt-id")
+    assert loaded_client is not None
+    assert "openid" in loaded_client.scope
+    assert "mcp" in loaded_client.scope
+
+    # Must validate openid without raising InvalidScopeError
+    validated = loaded_client.validate_scope("openid")
+    assert validated == ["openid"]
+
+
+
